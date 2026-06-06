@@ -1,0 +1,5 @@
+clevr_extracted/images/
+clevr_extracted/masks/
+my_env/
+model.pkl
+metadata.json
