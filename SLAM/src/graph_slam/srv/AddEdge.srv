@@ -1,0 +1,9 @@
+int32 from_id
+int32 to_id
+int32 type
+float64 dx
+float64 dy
+float64 dtheta
+float64[] information
+---
+bool success

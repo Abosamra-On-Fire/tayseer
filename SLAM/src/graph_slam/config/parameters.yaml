@@ -1,0 +1,31 @@
+# pipeline:
+#   min_dist_m: 0.2
+#   min_angle_deg: 10.0
+#   use_scan_matching_from_odom: true
+
+# scan_matcher:
+#   max_iterations: 50
+#   max_correspondence: 0.5
+#   fitness_threshold: 0.5
+#   transformation_eps: 1e-6
+
+# loop_closure:
+#   search_radius_m: 2.0
+#   min_node_separation_: 5
+#   icp_score_threshold: 0.3
+#   loop_closure_period_sec: 2.0
+
+# graph_optimizer:
+#   optimize_every_n: 10
+#   maximum_iterations: 20
+#   check_period_sec: 1.0
+
+# occupancy_mapper:
+#   map_resolution: 0.05
+#   map_width_m: 30.0
+#   map_height_m: 30.0
+#   publish_period_sec: 1.0
+
+# graph_manager:
+#   node_scale: 0.15
+#   edge_scale: 0.04

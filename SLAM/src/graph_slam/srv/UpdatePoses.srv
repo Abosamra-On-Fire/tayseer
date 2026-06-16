@@ -1,0 +1,6 @@
+int32[] ids
+float64[] xs
+float64[] ys
+float64[] thetas
+---
+bool success

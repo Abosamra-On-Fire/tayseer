@@ -1,0 +1,122 @@
+
+
+<launch>
+
+  <rosparam file="$(find graph_slam)/config/parameters.yaml" command="load"/>
+
+
+  <node pkg="graph_slam"
+        type="graph_manager"
+        name="graph_manager"
+        output="screen">
+
+    <!-- <param name="node_scale"
+           value=".15"/>
+
+    <param name="edge_width"
+           value=".04"/> -->
+
+  </node>
+
+
+  <node pkg="graph_slam"
+        type="scan_matcher"
+        name="scan_matcher"
+        output="screen">
+
+    <!-- <param name="max_iterations"
+           value="50"/>
+
+    <param name="max_correspondence"
+           value="0.5"/>
+
+    <param name="fitness_threshold"
+           value="0.5"/>
+
+    <param name="transformation_eps"
+           value="1e-6"/> -->
+
+  </node>
+
+
+  <node pkg="graph_slam"
+        type="pipeline"
+        name="pipeline"
+        output="screen">
+
+    <!-- <param name="min_dist_m"
+           value=".2"/>
+
+    <param name="min_angle_deg"
+           value="10.0"/>
+
+    <param name="use_scan_matching_from_odom"
+           value="true"/> -->
+
+  </node>
+
+
+  <node pkg="graph_slam"
+        type="loop_closure"
+        name="loop_closure"
+        output="screen">
+
+    <!-- <param name="search_radius_m"
+           value="2.0"/>
+
+    <param name="min_node_separation_"
+           value="5"/>
+
+    <param name="icp_score_threshold"
+           value=".3"/>
+
+    <param name="loop_closure_period_sec"
+           value="2.0"/> -->
+
+  </node>
+
+
+  <node pkg="graph_slam"
+        type="graph_optimizer"
+        name="graph_optimizer"
+        output="screen">
+
+    <!-- <param name="optimize_every_n"
+           value="10"/>
+
+    <param name="maximum_iterations"
+           value="20"/>
+
+    <param name="check_period_sec"
+           value="1.0"/> -->
+
+  </node>
+
+
+  <node pkg="graph_slam"
+        type="occupancy_mapper"
+        name="occupancy_mapper"
+        output="screen">
+
+    <!-- <param name="map_resolution"
+           value=".05"/>
+
+    <param name="map_width_m"
+           value="30.0"/>
+
+    <param name="map_height_m"
+           value="30.0"/>
+
+    <param name="publish_period_sec"
+           value="1.0"/> -->
+
+  </node>
+
+<!-- 
+  <node pkg="rviz"
+        type="rviz"
+        name="rviz"
+        args="-d $(find graph_slam)/rviz/graph_slam.rviz"
+        output="screen"/> -->
+
+</launch>

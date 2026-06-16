@@ -1,0 +1,12 @@
+sensor_msgs/LaserScan reference_scan
+sensor_msgs/LaserScan current_scan
+float64 init_dx
+float64 init_dy
+float64 init_dtheta
+---
+bool success
+float64 dx
+float64 dy
+float64 dtheta
+float64 score
+float64[] information

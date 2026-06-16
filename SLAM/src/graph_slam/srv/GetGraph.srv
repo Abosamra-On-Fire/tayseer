@@ -1,0 +1,14 @@
+---
+int32[] ids
+float64[] xs
+float64[] ys
+float64[] thetas
+sensor_msgs/LaserScan[] scans
+float64[] timestamps
+int32[] edges_from_id
+int32[] edges_to_id
+int32[] edges_type
+float64[] edges_dx
+float64[] edges_dy
+float64[] edges_dtheta
+float64[] edges_information
