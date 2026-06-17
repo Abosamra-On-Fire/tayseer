@@ -1,18 +1,18 @@
-#include <ros/ros.h>
-#include <nav_msgs/OccupancyGrid.h>
-#include <nav_msgs/Odometry.h>
-#include <sensor_msgs/LaserScan.h>
-#include <std_msgs/Bool.h>
-#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2/LinearMath/Quaternion.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
-#include <geometry_msgs/TransformStamped.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 
-#include <graph_slam/GetGraph.h>
+#include "graph_slam/srv/get_graph.hpp"
 #include "types.hpp"
 
 #include <cmath>
@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <random>
 #include <numeric>
+#include <chrono>
 
 using namespace std;
 namespace graph_slam {
@@ -33,30 +34,33 @@ struct Particle {
     double x, y, theta, weight;
 };
 
-class OccupancyMapper {
+class OccupancyMapper : public rclcpp::Node
+{
 public:
-    OccupancyMapper(ros::NodeHandle& nh, ros::NodeHandle& private_nh)
-    : nh_(nh), private_nh_(private_nh), tf_buffer_(), tf_listener_(tf_buffer_), rng_(std::random_device{}())
+    explicit OccupancyMapper()
+    : Node("occupancy_mapper"),
+      tf_buffer_(this->get_clock()),
+      tf_listener_(tf_buffer_, this),
+      rng_(std::random_device{}())
     {
-        private_nh_.param("map_resolution",    map_resolution_,    0.05);
-        private_nh_.param("map_width_m",        map_width_m_,       40.0);
-        private_nh_.param("map_height_m",       map_height_m_,      40.0);
-        private_nh_.param("publish_period_sec", publish_period_sec_, 0.05);
-        private_nh_.param("map_angle_step_deg", map_angle_step_deg_, 0.5);
-        private_nh_.param("fov_half_deg",       fov_half_deg_,    60.0);
-
-        private_nh_.param("localization_enabled", localization_enabled_, true);
-        private_nh_.param("num_particles",         num_particles_,        500);
-        private_nh_.param("particle_sigma_x",      particle_sigma_x_,     0.1);
-        private_nh_.param("particle_sigma_y",      particle_sigma_y_,     0.1);
-        private_nh_.param("particle_sigma_theta",  particle_sigma_theta_,  0.05);
-        private_nh_.param("motion_sigma_x",        motion_sigma_x_,       0.02);
-        private_nh_.param("motion_sigma_y",        motion_sigma_y_,       0.02);
-        private_nh_.param("motion_sigma_theta",    motion_sigma_theta_,   0.01);
-        private_nh_.param("resample_threshold",    resample_threshold_,   0.5);
-        private_nh_.param("scan_subsample",        scan_subsample_,       8);
-        private_nh_.param("odom_frame",            odom_frame_,           string("odom"));
-        private_nh_.param("base_frame",            base_frame_,           string("base_link"));
+        map_resolution_       = declare_parameter<double>("map_resolution",       0.05);
+        map_width_m_          = declare_parameter<double>("map_width_m",          40.0);
+        map_height_m_         = declare_parameter<double>("map_height_m",         40.0);
+        publish_period_sec_   = declare_parameter<double>("publish_period_sec",   0.05);
+        map_angle_step_deg_   = declare_parameter<double>("map_angle_step_deg",   0.5);
+        fov_half_deg_         = declare_parameter<double>("fov_half_deg",         60.0);
+        localization_enabled_ = declare_parameter<bool>  ("localization_enabled", true);
+        num_particles_        = declare_parameter<int>   ("num_particles",        500);
+        particle_sigma_x_     = declare_parameter<double>("particle_sigma_x",     0.1);
+        particle_sigma_y_     = declare_parameter<double>("particle_sigma_y",     0.1);
+        particle_sigma_theta_ = declare_parameter<double>("particle_sigma_theta", 0.05);
+        motion_sigma_x_       = declare_parameter<double>("motion_sigma_x",       0.02);
+        motion_sigma_y_       = declare_parameter<double>("motion_sigma_y",       0.02);
+        motion_sigma_theta_   = declare_parameter<double>("motion_sigma_theta",   0.01);
+        resample_threshold_   = declare_parameter<double>("resample_threshold",   0.5);
+        scan_subsample_       = declare_parameter<int>   ("scan_subsample",       8);
+        odom_frame_           = declare_parameter<string>("odom_frame",           string("odom"));
+        base_frame_           = declare_parameter<string>("base_frame",           string("base_link"));
 
         width_cells_  = static_cast<int>(map_width_m_  / map_resolution_);
         height_cells_ = static_cast<int>(map_height_m_ / map_resolution_);
@@ -70,43 +74,51 @@ public:
         map_odom_x_  = 0.0; map_odom_y_  = 0.0; map_odom_theta_  = 0.0;
         odom_received_ = false;
         map_ready_     = false;
+        busy_          = false;
 
-        pub_map_       = nh_.advertise<nav_msgs::OccupancyGrid>("/map", 1, true);
-        pub_particle_cloud_ = nh_.advertise<nav_msgs::OccupancyGrid>("/particle_cloud_debug", 1, false);
-        sub_trigger_   = nh_.subscribe("/graph_slam/trigger_remap", 1,
-                                       &OccupancyMapper::triggerCallback, this);
+        auto latched = rclcpp::QoS(1).transient_local();
+        pub_map_            = create_publisher<nav_msgs::msg::OccupancyGrid>("/map", latched);
+        pub_particle_cloud_ = create_publisher<nav_msgs::msg::OccupancyGrid>("/particle_cloud_debug", 1);
+
+        sub_trigger_ = create_subscription<std_msgs::msg::Bool>(
+            "/graph_slam/trigger_remap", 1,
+            [this](std_msgs::msg::Bool::SharedPtr msg){ triggerCallback(msg); });
 
         if (localization_enabled_) {
-            sub_scan_  = nh_.subscribe("/scan", 10, &OccupancyMapper::scanCallback,  this);
-            sub_initial_pose_ = nh_.subscribe("/initialpose", 1,
-                                              &OccupancyMapper::initialPoseCallback, this);
+            sub_scan_ = create_subscription<sensor_msgs::msg::LaserScan>(
+                "/scan", 10,
+                [this](sensor_msgs::msg::LaserScan::SharedPtr msg){ scanCallback(msg); });
+            sub_initial_pose_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+                "/initialpose", 1,
+                [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg){ initialPoseCallback(msg); });
         }
 
-        clt_get_graph_ = nh_.serviceClient<graph_slam::GetGraph>("/graph_slam/get_graph");
-        clt_get_graph_.waitForExistence();
+        clt_get_graph_ = create_client<graph_slam::srv::GetGraph>("/graph_slam/get_graph");
+        clt_get_graph_->wait_for_service();
 
-        timer_ = nh_.createTimer(ros::Duration(publish_period_sec_),
-                                 &OccupancyMapper::timerCallback, this);
+        timer_ = create_wall_timer(
+            std::chrono::duration<double>(publish_period_sec_),
+            [this](){ timerCallback(); });
 
-        ROS_INFO("[OccupancyMapper] %.0fx%.0f m @ %.3f m/cell = %dx%d cells  fov=+/-%.0fdeg  localization=%s",
-                 map_width_m_, map_height_m_, map_resolution_,
-                 width_cells_, height_cells_, fov_half_deg_,
-                 localization_enabled_ ? "ON" : "OFF");
+        RCLCPP_INFO(get_logger(),
+            "[OccupancyMapper] %.0fx%.0f m @ %.3f m/cell = %dx%d cells  fov=+/-%.0fdeg  localization=%s",
+            map_width_m_, map_height_m_, map_resolution_,
+            width_cells_, height_cells_, fov_half_deg_,
+            localization_enabled_ ? "ON" : "OFF");
     }
 
 private:
-    ros::NodeHandle    nh_, private_nh_;
-    ros::Subscriber    sub_trigger_;
-    ros::Subscriber    sub_scan_;
-    ros::Subscriber    sub_initial_pose_;
-    ros::Publisher     pub_map_;
-    ros::Publisher     pub_particle_cloud_;
-    ros::ServiceClient clt_get_graph_;
-    ros::Timer         timer_;
-    tf2_ros::TransformBroadcaster tf_broadcaster_;
-    tf2_ros::Buffer               tf_buffer_;
-    tf2_ros::TransformListener    tf_listener_;
-    std::mt19937                  rng_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                           sub_trigger_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr                   sub_scan_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_initial_pose_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr                     pub_map_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr                     pub_particle_cloud_;
+    rclcpp::Client<graph_slam::srv::GetGraph>::SharedPtr                           clt_get_graph_;
+    rclcpp::TimerBase::SharedPtr                                                   timer_;
+    tf2_ros::TransformBroadcaster                                                  tf_broadcaster_{this};
+    tf2_ros::Buffer                                                                tf_buffer_;
+    tf2_ros::TransformListener                                                     tf_listener_;
+    std::mt19937                                                                   rng_;
 
     double map_resolution_;
     double map_width_m_, map_height_m_;
@@ -131,24 +143,25 @@ private:
     double map_odom_x_,  map_odom_y_,  map_odom_theta_;
     bool   odom_received_;
     bool   map_ready_;
+    bool   busy_;
 
     int last_mapped_node_ = -1;
 
-    void triggerCallback(const std_msgs::Bool::ConstPtr& msg)
+    void triggerCallback(std_msgs::msg::Bool::SharedPtr msg)
     {
         if (msg->data) {
-            ROS_INFO("[OccupancyMapper] Full rebuild triggered");
+            RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild triggered");
             fullRebuild();
         }
     }
 
-    void timerCallback(const ros::TimerEvent&)
+    void timerCallback()
     {
         incrementalUpdate();
         broadcastMapTf();
     }
 
-    void initialPoseCallback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg)
+    void initialPoseCallback(geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
     {
         double ix = msg->pose.pose.position.x;
         double iy = msg->pose.pose.position.y;
@@ -157,18 +170,20 @@ private:
         double itheta = atan2(2.0*(q.w()*q.z()+q.x()*q.y()),
                               1.0-2.0*(q.y()*q.y()+q.z()*q.z()));
         initParticles(ix, iy, itheta);
-        ROS_INFO("[OccupancyMapper] Particles initialized from /initialpose (%.2f,%.2f,%.3f)",
-                 ix, iy, itheta);
+        RCLCPP_INFO(get_logger(),
+            "[OccupancyMapper] Particles initialized from /initialpose (%.2f,%.2f,%.3f)",
+            ix, iy, itheta);
     }
 
-    void scanCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
+    void scanCallback(sensor_msgs::msg::LaserScan::SharedPtr scan)
     {
         if (!map_ready_) return;
 
-        geometry_msgs::TransformStamped odom_tf;
+        geometry_msgs::msg::TransformStamped odom_tf;
         try {
             odom_tf = tf_buffer_.lookupTransform(odom_frame_, base_frame_,
-                                                 ros::Time(0), ros::Duration(0.05));
+                                                 tf2::TimePointZero,
+                                                 tf2::durationFromSec(0.05));
         } catch (tf2::TransformException& ex) {
             return;
         }
@@ -209,9 +224,9 @@ private:
     void initParticles(double cx, double cy, double ctheta)
     {
         particles_.resize(num_particles_);
-        std::normal_distribution<double> nx(cx,    particle_sigma_x_);
-        std::normal_distribution<double> ny(cy,    particle_sigma_y_);
-        std::normal_distribution<double> nt(ctheta,particle_sigma_theta_);
+        std::normal_distribution<double> nx(cx,     particle_sigma_x_);
+        std::normal_distribution<double> ny(cy,     particle_sigma_y_);
+        std::normal_distribution<double> nt(ctheta, particle_sigma_theta_);
         for (auto& p : particles_) {
             p.x = nx(rng_); p.y = ny(rng_); p.theta = nt(rng_);
             p.weight = 1.0 / num_particles_;
@@ -220,9 +235,9 @@ private:
 
     void motionUpdate(double dx, double dy, double dtheta)
     {
-        std::normal_distribution<double> nx(0.0, motion_sigma_x_   + fabs(dx)*0.1);
-        std::normal_distribution<double> ny(0.0, motion_sigma_y_   + fabs(dy)*0.1);
-        std::normal_distribution<double> nt(0.0, motion_sigma_theta_+ fabs(dtheta)*0.05);
+        std::normal_distribution<double> nx(0.0, motion_sigma_x_    + fabs(dx)*0.1);
+        std::normal_distribution<double> ny(0.0, motion_sigma_y_    + fabs(dy)*0.1);
+        std::normal_distribution<double> nt(0.0, motion_sigma_theta_ + fabs(dtheta)*0.05);
         for (auto& p : particles_) {
             double s = sin(p.theta), c = cos(p.theta);
             p.x     += c*dx - s*dy + nx(rng_);
@@ -249,9 +264,9 @@ private:
         return (best > 0.5) ? 1.0 : ((best < -0.5) ? 0.0 : 0.5);
     }
 
-    void measurementUpdate(const sensor_msgs::LaserScan& scan)
+    void measurementUpdate(const sensor_msgs::msg::LaserScan& scan)
     {
-        int N = (int)scan.ranges.size();
+        int N = static_cast<int>(scan.ranges.size());
         for (auto& p : particles_) {
             double log_w = 0.0;
             for (int i = 0; i < N; i += scan_subsample_) {
@@ -294,7 +309,7 @@ private:
         int j = 0;
         vector<Particle> new_p(num_particles_);
         for (int i = 0; i < num_particles_; ++i) {
-            double target = u + (double)i / num_particles_;
+            double target = u + static_cast<double>(i) / num_particles_;
             while (j < num_particles_-1 && cdf[j] < target) ++j;
             new_p[i] = particles_[j];
             new_p[i].weight = 1.0 / num_particles_;
@@ -335,46 +350,60 @@ private:
 
     void fullRebuild()
     {
-        graph_slam::GetGraph srv;
-        if (!clt_get_graph_.call(srv)) {
-            ROS_ERROR("[OccupancyMapper] get_graph failed"); return;
-        }
-        int N = (int)srv.response.ids.size();
-        if (N == 0) { ROS_WARN("[OccupancyMapper] Graph empty"); return; }
+        if (busy_) return;
+        busy_ = true;
 
-        fill(log_odds_.begin(), log_odds_.end(), 0.0);
+        auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
+        clt_get_graph_->async_send_request(req,
+            [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture future)
+            {
+                auto resp = *(future.get());
+                int N = static_cast<int>(resp.ids.size());
+                if (N == 0) {
+                    RCLCPP_WARN(get_logger(), "[OccupancyMapper] Graph empty");
+                    busy_ = false;
+                    return;
+                }
 
-        for (int i = 0; i < N; ++i)
-            insertScan(srv.response.xs[i], srv.response.ys[i],
-                       srv.response.thetas[i], srv.response.scans[i]);
+                fill(log_odds_.begin(), log_odds_.end(), 0.0);
+                for (int i = 0; i < N; ++i)
+                    insertScan(resp.xs[i], resp.ys[i], resp.thetas[i], resp.scans[i]);
 
-        last_mapped_node_ = N - 1;
-        map_ready_ = true;
-        publishMap();
-        ROS_INFO("[OccupancyMapper] Full rebuild: %d nodes", N);
+                last_mapped_node_ = N - 1;
+                map_ready_ = true;
+                publishMap();
+                RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild: %d nodes", N);
+                busy_ = false;
+            });
     }
 
     void incrementalUpdate()
     {
-        graph_slam::GetGraph srv;
-        if (!clt_get_graph_.call(srv)) return;
+        if (busy_) return;
+        busy_ = true;
 
-        int N = (int)srv.response.ids.size();
-        bool changed = false;
-        for (int i = last_mapped_node_ + 1; i < N; ++i) {
-            insertScan(srv.response.xs[i], srv.response.ys[i],
-                       srv.response.thetas[i], srv.response.scans[i]);
-            changed = true;
-        }
-        if (changed) {
-            publishMap();
-            last_mapped_node_ = N - 1;
-            map_ready_ = true;
-        }
+        auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
+        clt_get_graph_->async_send_request(req,
+            [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture future)
+            {
+                auto resp = *(future.get());
+                int N = static_cast<int>(resp.ids.size());
+                bool changed = false;
+                for (int i = last_mapped_node_ + 1; i < N; ++i) {
+                    insertScan(resp.xs[i], resp.ys[i], resp.thetas[i], resp.scans[i]);
+                    changed = true;
+                }
+                if (changed) {
+                    publishMap();
+                    last_mapped_node_ = N - 1;
+                    map_ready_ = true;
+                }
+                busy_ = false;
+            });
     }
 
     void insertScan(double x, double y, double theta,
-                    const sensor_msgs::LaserScan& scan)
+                    const sensor_msgs::msg::LaserScan& scan)
     {
         if (scan.ranges.empty()) return;
 
@@ -383,14 +412,11 @@ private:
 
         double step_rad = map_angle_step_deg_ * M_PI / 180.0;
         int    step     = max(1, static_cast<int>(step_rad / scan.angle_increment));
+        double fov_rad  = fov_half_deg_ * M_PI / 180.0;
 
-        double fov_rad = fov_half_deg_ * M_PI / 180.0;
-
-        int num_rays = (int)scan.ranges.size();
-        for (int i = 0; i < num_rays; i += step)
-        {
-            double angle = scan.angle_min + i * scan.angle_increment;
-
+        int num_rays = static_cast<int>(scan.ranges.size());
+        for (int i = 0; i < num_rays; i += step) {
+            double angle  = scan.angle_min + i * scan.angle_increment;
             double a_norm = fmod(angle + M_PI, 2.0 * M_PI) - M_PI;
             if (fabs(a_norm) > fov_rad) continue;
 
@@ -400,16 +426,12 @@ private:
             double global_angle = theta + angle;
 
             if (hit) {
-                double wx = x + r * cos(global_angle);
-                double wy = y + r * sin(global_angle);
-                int ex = worldToCell(wx, true);
-                int ey = worldToCell(wy, false);
+                int ex = worldToCell(x + r * cos(global_angle), true);
+                int ey = worldToCell(y + r * sin(global_angle), false);
                 bresenham(rx, ry, ex, ey, true);
             } else {
-                double wx = x + scan.range_max * cos(global_angle);
-                double wy = y + scan.range_max * sin(global_angle);
-                int ex = worldToCell(wx, true);
-                int ey = worldToCell(wy, false);
+                int ex = worldToCell(x + scan.range_max * cos(global_angle), true);
+                int ey = worldToCell(y + scan.range_max * sin(global_angle), false);
                 bresenham(rx, ry, ex, ey, false);
             }
         }
@@ -424,17 +446,10 @@ private:
         int f  = dx - dy;
         int x  = x0, y = y0;
 
-        while (true)
-        {
+        while (true) {
             if (x < 0 || x >= width_cells_ || y < 0 || y >= height_cells_) break;
-
-            if (x == x1 && y == y1) {
-                updateCell(x, y, mark_hit ? LOGODD_HIT : LOGODD_MISS);
-                break;
-            }
-
+            if (x == x1 && y == y1) { updateCell(x, y, mark_hit ? LOGODD_HIT : LOGODD_MISS); break; }
             updateCell(x, y, LOGODD_MISS);
-
             int f2 = 2 * f;
             if (f2 > -dy) { f -= dy; x += sx; }
             if (f2 <  dx) { f += dx; y += sy; }
@@ -455,9 +470,9 @@ private:
 
     void publishMap()
     {
-        nav_msgs::OccupancyGrid grid;
+        nav_msgs::msg::OccupancyGrid grid;
         grid.header.frame_id           = "map";
-        grid.header.stamp              = ros::Time::now();
+        grid.header.stamp              = this->get_clock()->now();
         grid.info.resolution           = map_resolution_;
         grid.info.width                = width_cells_;
         grid.info.height               = height_cells_;
@@ -471,13 +486,13 @@ private:
             else if (log_odds_[i] < -0.5) grid.data[i] = 0;
             else                           grid.data[i] = -1;
         }
-        pub_map_.publish(grid);
+        pub_map_->publish(grid);
     }
 
     void broadcastMapTf()
     {
-        geometry_msgs::TransformStamped ts;
-        ts.header.stamp    = ros::Time::now();
+        geometry_msgs::msg::TransformStamped ts;
+        ts.header.stamp    = this->get_clock()->now();
         ts.header.frame_id = "map";
         ts.child_frame_id  = odom_frame_;
         ts.transform.translation.x = map_odom_x_;
@@ -494,10 +509,9 @@ private:
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "occupancy_mapper");
-    ros::NodeHandle nh;
-    ros::NodeHandle private_nh("~");
-    graph_slam::OccupancyMapper mapper(nh, private_nh);
-    ros::spin();
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<graph_slam::OccupancyMapper>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
     return 0;
 }

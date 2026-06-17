@@ -1,122 +1,127 @@
+"""
+Run with:
+    ros2 launch graph_slam graph_slam.launch.py
+"""
+
+from launch import LaunchDescription
+from launch_ros.actions import Node
 
 
-<launch>
+def generate_launch_description():
+    return LaunchDescription([
 
-  <rosparam file="$(find graph_slam)/config/parameters.yaml" command="load"/>
+        # ── 1. Graph Manager (core data store) ───────────────────────────────
+        Node(
+            package    = "graph_slam",
+            executable = "graph_manager",          # name in CMakeLists install(TARGETS ...)
+            name       = "graph_manager",
+            output     = "screen",
+            parameters = [{
+                "node_scale": 0.05,
+                "edge_width": 0.02,
+            }],
+        ),
 
+        # ── 2. Scan Matcher (point-to-line ICP service) ───────────────────────
+        Node(
+            package    = "graph_slam",
+            executable = "scan_matcher",
+            name       = "scan_matcher",
+            output     = "screen",
+            parameters = [{
+                "max_iterations":     50,
+                "max_correspondence": 0.6,
+                "fitness_threshold":  0.05,
+                "transformation_eps": 1e-6,
+                "downsample_deg":     0.5,
+                "line_neighbours":    10,
+            }],
+        ),
 
-  <node pkg="graph_slam"
-        type="graph_manager"
-        name="graph_manager"
-        output="screen">
+        # ── 3. Graph Pipeline (keyframe + odometry edges) ─────────────────────
+        Node(
+            package    = "graph_slam",
+            executable = "pipeline",
+            name       = "pipeline",
+            output     = "screen",
+            parameters = [{
+                "min_dist_m":                   0.3,
+                "min_angle_deg":                30.0,
+                "use_scan_matching_from_odom":  True,
+                "fallback_to_odom_on_icp_fail": True,
+                "corridor_degeneracy_thr":      0.05,
+                "icp_score_threshold":          0.05,
+            }],
+            # remap the laser topic to match your hardware
+            remappings = [
+                ("limo/scan", "/scan"),            # ← change if your scan topic differs
+            ],
+        ),
 
-    <!-- <param name="node_scale"
-           value=".15"/>
+        # ── 4. Loop Closure (Scan Context + ICP verification) ─────────────────
+        Node(
+            package    = "graph_slam",
+            executable = "loop_closure",
+            name       = "loop_closure",
+            output     = "screen",
+            parameters = [{
+                "max_range":           3.0,
+                "min_node_separation": 40,
+                "num_candidates":      5,
+                "sc_threshold":        0.15,
+                "icp_threshold":       0.02,
+                "max_lc_per_tick":     1,
+                "period_sec":          8.0,
+                "max_icp_translation": 0.5,
+                "query_window":        5,
+                "max_euclidean_dist":  3.0,
+            }],
+        ),
 
-    <param name="edge_width"
-           value=".04"/> -->
+        # ── 5. Graph Optimizer (g2o pose-graph) ───────────────────────────────
+        Node(
+            package    = "graph_slam",
+            executable = "graph_optimizer",
+            name       = "graph_optimizer",
+            output     = "screen",
+            parameters = [{
+                "optimize_every_n":     10,
+                "maximum_iterations":   50,
+                "check_period_sec":     2.0,
+                "huber_delta":          0.3,
+                "phase1_iterations":    30,
+                "lc_chi2_threshold":    15.0,
+                "do_outlier_rejection": True,
+                "min_lc_to_optimize":   2,
+            }],
+        ),
 
-  </node>
-
-
-  <node pkg="graph_slam"
-        type="scan_matcher"
-        name="scan_matcher"
-        output="screen">
-
-    <!-- <param name="max_iterations"
-           value="50"/>
-
-    <param name="max_correspondence"
-           value="0.5"/>
-
-    <param name="fitness_threshold"
-           value="0.5"/>
-
-    <param name="transformation_eps"
-           value="1e-6"/> -->
-
-  </node>
-
-
-  <node pkg="graph_slam"
-        type="pipeline"
-        name="pipeline"
-        output="screen">
-
-    <!-- <param name="min_dist_m"
-           value=".2"/>
-
-    <param name="min_angle_deg"
-           value="10.0"/>
-
-    <param name="use_scan_matching_from_odom"
-           value="true"/> -->
-
-  </node>
-
-
-  <node pkg="graph_slam"
-        type="loop_closure"
-        name="loop_closure"
-        output="screen">
-
-    <!-- <param name="search_radius_m"
-           value="2.0"/>
-
-    <param name="min_node_separation_"
-           value="5"/>
-
-    <param name="icp_score_threshold"
-           value=".3"/>
-
-    <param name="loop_closure_period_sec"
-           value="2.0"/> -->
-
-  </node>
-
-
-  <node pkg="graph_slam"
-        type="graph_optimizer"
-        name="graph_optimizer"
-        output="screen">
-
-    <!-- <param name="optimize_every_n"
-           value="10"/>
-
-    <param name="maximum_iterations"
-           value="20"/>
-
-    <param name="check_period_sec"
-           value="1.0"/> -->
-
-  </node>
-
-
-  <node pkg="graph_slam"
-        type="occupancy_mapper"
-        name="occupancy_mapper"
-        output="screen">
-
-    <!-- <param name="map_resolution"
-           value=".05"/>
-
-    <param name="map_width_m"
-           value="30.0"/>
-
-    <param name="map_height_m"
-           value="30.0"/>
-
-    <param name="publish_period_sec"
-           value="1.0"/> -->
-
-  </node>
-
-<!-- 
-  <node pkg="rviz"
-        type="rviz"
-        name="rviz"
-        args="-d $(find graph_slam)/rviz/graph_slam.rviz"
-        output="screen"/> -->
-
-</launch>
+        # ── 6. Occupancy Mapper (incremental + particle filter localisation) ──
+        Node(
+            package    = "graph_slam",
+            executable = "occupancy_mapper",
+            name       = "occupancy_mapper",
+            output     = "screen",
+            parameters = [{
+                "map_resolution":      0.05,
+                "map_width_m":         40.0,
+                "map_height_m":        40.0,
+                "publish_period_sec":  0.05,
+                "map_angle_step_deg":  0.5,
+                "fov_half_deg":        60.0,
+                # particle filter
+                "localization_enabled": True,
+                "num_particles":        500,
+                "particle_sigma_x":     0.1,
+                "particle_sigma_y":     0.1,
+                "particle_sigma_theta": 0.05,
+                "motion_sigma_x":       0.02,
+                "motion_sigma_y":       0.02,
+                "motion_sigma_theta":   0.01,
+                "resample_threshold":   0.5,
+                "scan_subsample":       8,
+                "odom_frame":           "odom",
+                "base_frame":           "base_link",
+            }],
+        ),
+    ])

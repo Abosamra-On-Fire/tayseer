@@ -1,6 +1,6 @@
-#include <ros/ros.h>
-#include <sensor_msgs/LaserScan.h>
-#include <graph_slam/ScanMatch.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include "graph_slam/srv/scan_match.hpp"
 #include "types.hpp"
 #include <Eigen/Dense>
 #include <Eigen/SVD>
@@ -11,7 +11,7 @@
 using namespace std;
 namespace graph_slam {
 
-vector<Point2D> scanToCloud(sensor_msgs::LaserScan& scan, double bucket_deg)
+vector<Point2D> scanToCloud(sensor_msgs::msg::LaserScan& scan, double bucket_deg)
 {
     vector<Point2D> cloud;
     if (scan.ranges.empty()) return cloud;
@@ -124,7 +124,7 @@ vector<Association> associatePointToLine(Cloud src, Cloud target,
             if (!features[j].valid) continue;
             double dx = src[i].x - target[j].x, dy = src[i].y - target[j].y;
             double d2 = dx*dx + dy*dy;
-            if (d2 < best_dist_sq) { best_dist_sq = d2; best_j = j; }
+            if (d2 < best_dist_sq) { best_dist_sq = d2; best_j = static_cast<int>(j); }
         }
         if (best_j < 0) continue;
 
@@ -207,44 +207,48 @@ void composeSE2(double ax, double ay, double ath,
     oth = wrapAngle(ath + bth);
 }
 
-class ScanMatcher {
+class ScanMatcher : public rclcpp::Node
+{
 public:
-    ScanMatcher(ros::NodeHandle& nh, ros::NodeHandle& private_nh)
-    : nh_(nh), private_nh_(private_nh)
+    explicit ScanMatcher()
+    : Node("scan_matcher")
     {
-        private_nh_.param("max_iterations",     max_iterations_,    50);
-        private_nh_.param("max_correspondence", max_correspondence_, 0.6);
-        private_nh_.param("fitness_threshold",  fitness_threshold_,  0.05);
-        private_nh_.param("transformation_eps", transformation_eps_, 1e-6);
-        private_nh_.param("downsample_deg",     downsample_deg_,     0.5);
-        private_nh_.param("line_neighbours",    line_neighbours_,    10);
+        max_iterations_    = declare_parameter<int>   ("max_iterations",     50);
+        max_correspondence_ = declare_parameter<double>("max_correspondence", 0.6);
+        fitness_threshold_  = declare_parameter<double>("fitness_threshold",  0.05);
+        transformation_eps_ = declare_parameter<double>("transformation_eps", 1e-6);
+        downsample_deg_     = declare_parameter<double>("downsample_deg",     0.5);
+        line_neighbours_    = declare_parameter<int>   ("line_neighbours",    10);
 
-        svc_ = nh_.advertiseService("graph_slam/scan_match",
-                                    &ScanMatcher::matchCallback, this);
-        ROS_INFO("[ScanMatcher] Point-to-line ICP ready. "
-                 "downsample=%.1fdeg max_corr=%.2fm line_k=%d",
-                 downsample_deg_, max_correspondence_, line_neighbours_);
+        svc_ = create_service<graph_slam::srv::ScanMatch>(
+            "graph_slam/scan_match",
+            [this](const graph_slam::srv::ScanMatch::Request::SharedPtr  req,
+                         graph_slam::srv::ScanMatch::Response::SharedPtr res)
+            { matchCallback(req, res); });
+
+        RCLCPP_INFO(get_logger(),
+            "[ScanMatcher] Point-to-line ICP ready. downsample=%.1fdeg max_corr=%.2fm line_k=%d",
+            downsample_deg_, max_correspondence_, line_neighbours_);
     }
 
 private:
-    ros::NodeHandle    nh_, private_nh_;
-    ros::ServiceServer svc_;
+    rclcpp::Service<graph_slam::srv::ScanMatch>::SharedPtr svc_;
     int    max_iterations_, line_neighbours_;
     double max_correspondence_, fitness_threshold_, transformation_eps_;
     double downsample_deg_;
 
-    bool matchCallback(graph_slam::ScanMatch::Request& req,
-                       graph_slam::ScanMatch::Response& res)
+    void matchCallback(const graph_slam::srv::ScanMatch::Request::SharedPtr  req,
+                             graph_slam::srv::ScanMatch::Response::SharedPtr res)
     {
-        Cloud ref  = scanToCloud(req.reference_scan, downsample_deg_);
-        Cloud curr = scanToCloud(req.current_scan,   downsample_deg_);
-        if (ref.empty() || curr.empty()) { res.success = false; return true; }
+        Cloud ref  = scanToCloud(req->reference_scan, downsample_deg_);
+        Cloud curr = scanToCloud(req->current_scan,   downsample_deg_);
+        if (ref.empty() || curr.empty()) { res->success = false; return; }
 
         vector<LineFeature> ref_lines = extractLines(ref, line_neighbours_);
 
-        double acc_dx  = req.init_dx;
-        double acc_dy  = req.init_dy;
-        double acc_dth = req.init_dtheta;
+        double acc_dx  = req->init_dx;
+        double acc_dy  = req->init_dy;
+        double acc_dth = req->init_dtheta;
 
         Cloud transformed = applyTransform(curr, acc_dx, acc_dy, acc_dth);
         double prev_score = numeric_limits<double>::max();
@@ -277,20 +281,20 @@ private:
         double score = fitnessScorePointToLine(final_assoc);
 
         if (score > fitness_threshold_ || final_assoc.size() < 6) {
-            res.success = false;
-            res.score   = score;
-            return true;
+            res->success = false;
+            res->score   = score;
+            return;
         }
 
-        res.success = true;
-        res.dx      = acc_dx;
-        res.dy      = acc_dy;
-        res.dtheta  = acc_dth;
-        res.score   = score;
+        res->success = true;
+        res->dx      = acc_dx;
+        res->dy      = acc_dy;
+        res->dtheta  = acc_dth;
+        res->score   = score;
 
         double sigma2   = max(score, 1e-6);
-        double info_xy  = min(1.0 / sigma2,        400.0);
-        double info_yaw = min(info_xy * 0.25,      200.0);
+        double info_xy  = min(1.0 / sigma2,   400.0);
+        double info_yaw = min(info_xy * 0.25, 200.0);
 
         Eigen::Matrix3d info = Eigen::Matrix3d::Zero();
         info(0,0) = info_xy;
@@ -299,8 +303,7 @@ private:
 
         for (int r = 0; r < 3; ++r)
             for (int c = 0; c < 3; ++c)
-                res.information.push_back(info(r,c));
-        return true;
+                res->information.push_back(info(r,c));
     }
 };
 
@@ -308,9 +311,8 @@ private:
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "scan_matcher");
-    ros::NodeHandle nh, pnh("~");
-    graph_slam::ScanMatcher sm(nh, pnh);
-    ros::spin();
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<graph_slam::ScanMatcher>());
+    rclcpp::shutdown();
     return 0;
 }
