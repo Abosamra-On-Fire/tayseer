@@ -5,20 +5,33 @@ Run with:
 
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
+    use_sim_time = LaunchConfiguration("use_sim_time", default="true")
+
+    sim_time_param = {"use_sim_time": use_sim_time}
+
     return LaunchDescription([
+
+        DeclareLaunchArgument(
+            "use_sim_time",
+            default_value="true",
+            description="Use simulation (Gazebo) clock if true",
+        ),
 
         # ── 1. Graph Manager (core data store) ───────────────────────────────
         Node(
             package    = "graph_slam",
-            executable = "graph_manager",          # name in CMakeLists install(TARGETS ...)
+            executable = "graph_manager",
             name       = "graph_manager",
             output     = "screen",
             parameters = [{
                 "node_scale": 0.05,
                 "edge_width": 0.02,
+                **sim_time_param,
             }],
         ),
 
@@ -35,6 +48,7 @@ def generate_launch_description():
                 "transformation_eps": 1e-6,
                 "downsample_deg":     0.5,
                 "line_neighbours":    10,
+                **sim_time_param,
             }],
         ),
 
@@ -51,10 +65,10 @@ def generate_launch_description():
                 "fallback_to_odom_on_icp_fail": True,
                 "corridor_degeneracy_thr":      0.05,
                 "icp_score_threshold":          0.05,
+                **sim_time_param,
             }],
-            # remap the laser topic to match your hardware
             remappings = [
-                ("limo/scan", "/scan"),            # ← change if your scan topic differs
+                ("limo/scan", "/scan"),
             ],
         ),
 
@@ -75,6 +89,7 @@ def generate_launch_description():
                 "max_icp_translation": 0.5,
                 "query_window":        5,
                 "max_euclidean_dist":  3.0,
+                **sim_time_param,
             }],
         ),
 
@@ -93,6 +108,7 @@ def generate_launch_description():
                 "lc_chi2_threshold":    15.0,
                 "do_outlier_rejection": True,
                 "min_lc_to_optimize":   2,
+                **sim_time_param,
             }],
         ),
 
@@ -109,7 +125,6 @@ def generate_launch_description():
                 "publish_period_sec":  0.05,
                 "map_angle_step_deg":  0.5,
                 "fov_half_deg":        60.0,
-                # particle filter
                 "localization_enabled": True,
                 "num_particles":        500,
                 "particle_sigma_x":     0.1,
@@ -122,6 +137,7 @@ def generate_launch_description():
                 "scan_subsample":       8,
                 "odom_frame":           "odom",
                 "base_frame":           "base_link",
+                **sim_time_param,
             }],
         ),
     ])

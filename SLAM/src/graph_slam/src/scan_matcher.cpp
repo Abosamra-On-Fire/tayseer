@@ -14,7 +14,8 @@ namespace graph_slam {
 vector<Point2D> scanToCloud(sensor_msgs::msg::LaserScan& scan, double bucket_deg)
 {
     vector<Point2D> cloud;
-    if (scan.ranges.empty()) return cloud;
+    if (scan.ranges.empty()) 
+        return cloud;
     double bucket_rad = bucket_deg * M_PI / 180.0;
     int num_buckets = max(1, static_cast<int>(ceil((scan.angle_max - scan.angle_min) / bucket_rad)));
 
@@ -124,7 +125,7 @@ vector<Association> associatePointToLine(Cloud src, Cloud target,
             if (!features[j].valid) continue;
             double dx = src[i].x - target[j].x, dy = src[i].y - target[j].y;
             double d2 = dx*dx + dy*dy;
-            if (d2 < best_dist_sq) { best_dist_sq = d2; best_j = static_cast<int>(j); }
+            if (d2 < best_dist_sq) { best_dist_sq = d2; best_j = j; }
         }
         if (best_j < 0) continue;
 
@@ -210,25 +211,23 @@ void composeSE2(double ax, double ay, double ath,
 class ScanMatcher : public rclcpp::Node
 {
 public:
-    explicit ScanMatcher()
-    : Node("scan_matcher")
+    ScanMatcher() : Node("scan_matcher")
     {
-        max_iterations_    = declare_parameter<int>   ("max_iterations",     50);
-        max_correspondence_ = declare_parameter<double>("max_correspondence", 0.6);
-        fitness_threshold_  = declare_parameter<double>("fitness_threshold",  0.05);
-        transformation_eps_ = declare_parameter<double>("transformation_eps", 1e-6);
-        downsample_deg_     = declare_parameter<double>("downsample_deg",     0.5);
-        line_neighbours_    = declare_parameter<int>   ("line_neighbours",    10);
+        max_iterations_     = this->declare_parameter("max_iterations",     50);
+        max_correspondence_ = this->declare_parameter("max_correspondence", 0.6);
+        fitness_threshold_  = this->declare_parameter("fitness_threshold",  0.05);
+        transformation_eps_ = this->declare_parameter("transformation_eps", 1e-6);
+        downsample_deg_     = this->declare_parameter("downsample_deg",     0.5);
+        line_neighbours_    = this->declare_parameter("line_neighbours",    10);
 
-        svc_ = create_service<graph_slam::srv::ScanMatch>(
+        svc_ = this->create_service<graph_slam::srv::ScanMatch>(
             "graph_slam/scan_match",
-            [this](const graph_slam::srv::ScanMatch::Request::SharedPtr  req,
-                         graph_slam::srv::ScanMatch::Response::SharedPtr res)
-            { matchCallback(req, res); });
+            std::bind(&ScanMatcher::matchCallback, this,
+                      std::placeholders::_1, std::placeholders::_2));
 
-        RCLCPP_INFO(get_logger(),
-            "[ScanMatcher] Point-to-line ICP ready. downsample=%.1fdeg max_corr=%.2fm line_k=%d",
-            downsample_deg_, max_correspondence_, line_neighbours_);
+        RCLCPP_INFO(this->get_logger(), "[ScanMatcher] Point-to-line ICP ready. "
+                 "downsample=%.1fdeg max_corr=%.2fm line_k=%d",
+                 downsample_deg_, max_correspondence_, line_neighbours_);
     }
 
 private:
@@ -237,8 +236,8 @@ private:
     double max_correspondence_, fitness_threshold_, transformation_eps_;
     double downsample_deg_;
 
-    void matchCallback(const graph_slam::srv::ScanMatch::Request::SharedPtr  req,
-                             graph_slam::srv::ScanMatch::Response::SharedPtr res)
+    void matchCallback(const std::shared_ptr<graph_slam::srv::ScanMatch::Request> req,
+                       std::shared_ptr<graph_slam::srv::ScanMatch::Response> res)
     {
         Cloud ref  = scanToCloud(req->reference_scan, downsample_deg_);
         Cloud curr = scanToCloud(req->current_scan,   downsample_deg_);
@@ -263,7 +262,7 @@ private:
                 break;
 
             double ndx, ndy, ndth;
-            composeSE2(acc_dx, acc_dy, acc_dth, sdx, sdy, sdth, ndx, ndy, ndth);
+            composeSE2(sdx, sdy, sdth, acc_dx, acc_dy, acc_dth, ndx, ndy, ndth);
             acc_dx = ndx; acc_dy = ndy; acc_dth = ndth;
 
             transformed = applyTransform(transformed, sdx, sdy, sdth);
@@ -293,8 +292,8 @@ private:
         res->score   = score;
 
         double sigma2   = max(score, 1e-6);
-        double info_xy  = min(1.0 / sigma2,   400.0);
-        double info_yaw = min(info_xy * 0.25, 200.0);
+        double info_xy  = min(1.0 / sigma2,        400.0);
+        double info_yaw = min(info_xy * 0.25,      200.0);
 
         Eigen::Matrix3d info = Eigen::Matrix3d::Zero();
         info(0,0) = info_xy;
@@ -312,7 +311,8 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<graph_slam::ScanMatcher>());
+    auto node = std::make_shared<graph_slam::ScanMatcher>();
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }

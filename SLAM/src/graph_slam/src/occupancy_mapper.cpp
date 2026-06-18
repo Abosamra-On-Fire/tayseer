@@ -9,6 +9,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
@@ -20,15 +21,14 @@
 #include <algorithm>
 #include <random>
 #include <numeric>
-#include <chrono>
 
 using namespace std;
 namespace graph_slam {
 
-const double LOGODD_HIT  =  0.85;
-const double LOGODD_MISS = -0.30;
-const double LOGODD_MIN  = -5.0;
-const double LOGODD_MAX  =  5.0;
+const double LOGODD_HIT  =  1.0;
+const double LOGODD_MISS = -0.25;
+const double LOGODD_MIN  = -2.0;
+const double LOGODD_MAX  =  4.0;
 
 struct Particle {
     double x, y, theta, weight;
@@ -43,12 +43,14 @@ public:
       tf_listener_(tf_buffer_, this),
       rng_(std::random_device{}())
     {
+        // declare_parameter<bool>("use_sim_time", true);
         map_resolution_       = declare_parameter<double>("map_resolution",       0.05);
         map_width_m_          = declare_parameter<double>("map_width_m",          40.0);
         map_height_m_         = declare_parameter<double>("map_height_m",         40.0);
         publish_period_sec_   = declare_parameter<double>("publish_period_sec",   0.05);
         map_angle_step_deg_   = declare_parameter<double>("map_angle_step_deg",   0.5);
-        fov_half_deg_         = declare_parameter<double>("fov_half_deg",         60.0);
+        fov_half_deg_         = declare_parameter<double>("fov_half_deg",         135.0);
+
         localization_enabled_ = declare_parameter<bool>  ("localization_enabled", true);
         num_particles_        = declare_parameter<int>   ("num_particles",        500);
         particle_sigma_x_     = declare_parameter<double>("particle_sigma_x",     0.1);
@@ -61,44 +63,52 @@ public:
         scan_subsample_       = declare_parameter<int>   ("scan_subsample",       8);
         odom_frame_           = declare_parameter<string>("odom_frame",           string("odom"));
         base_frame_           = declare_parameter<string>("base_frame",           string("base_link"));
-
+        
         width_cells_  = static_cast<int>(map_width_m_  / map_resolution_);
         height_cells_ = static_cast<int>(map_height_m_ / map_resolution_);
         origin_x_ = -map_width_m_  / 2.0;
         origin_y_ = -map_height_m_ / 2.0;
 
         log_odds_.assign(width_cells_ * height_cells_, 0.0);
+        hit_counts_.assign(width_cells_ * height_cells_, 0);
+        miss_counts_.assign(width_cells_ * height_cells_, 0);
 
         localization_initialized_ = false;
         last_odom_x_ = 0.0; last_odom_y_ = 0.0; last_odom_theta_ = 0.0;
         map_odom_x_  = 0.0; map_odom_y_  = 0.0; map_odom_theta_  = 0.0;
         odom_received_ = false;
         map_ready_     = false;
-        busy_          = false;
 
-        auto latched = rclcpp::QoS(1).transient_local();
-        pub_map_            = create_publisher<nav_msgs::msg::OccupancyGrid>("/map", latched);
-        pub_particle_cloud_ = create_publisher<nav_msgs::msg::OccupancyGrid>("/particle_cloud_debug", 1);
+        cb_group_reentrant_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        cb_group_get_graph_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
+        rclcpp::SubscriptionOptions sub_opts;
+        sub_opts.callback_group = cb_group_reentrant_;
+
+        pub_map_     = create_publisher<nav_msgs::msg::OccupancyGrid>("/map", rclcpp::QoS(1).transient_local());
         sub_trigger_ = create_subscription<std_msgs::msg::Bool>(
             "/graph_slam/trigger_remap", 1,
-            [this](std_msgs::msg::Bool::SharedPtr msg){ triggerCallback(msg); });
+            [this](std_msgs::msg::Bool::SharedPtr msg){ triggerCallback(msg); }, sub_opts);
+        sub_odom_    = create_subscription<nav_msgs::msg::Odometry>(
+            "/odom", 1,
+            [this](nav_msgs::msg::Odometry::SharedPtr msg){ odomCallback(msg); }, sub_opts);
 
         if (localization_enabled_) {
             sub_scan_ = create_subscription<sensor_msgs::msg::LaserScan>(
                 "/scan", 10,
-                [this](sensor_msgs::msg::LaserScan::SharedPtr msg){ scanCallback(msg); });
+                [this](sensor_msgs::msg::LaserScan::SharedPtr msg){ scanCallback(msg); }, sub_opts);
             sub_initial_pose_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
                 "/initialpose", 1,
-                [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg){ initialPoseCallback(msg); });
+                [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg){ initialPoseCallback(msg); }, sub_opts);
         }
 
-        clt_get_graph_ = create_client<graph_slam::srv::GetGraph>("/graph_slam/get_graph");
+        clt_get_graph_ = create_client<graph_slam::srv::GetGraph>("graph_slam/get_graph",
+            rmw_qos_profile_services_default, cb_group_get_graph_);
         clt_get_graph_->wait_for_service();
 
         timer_ = create_wall_timer(
             std::chrono::duration<double>(publish_period_sec_),
-            [this](){ timerCallback(); });
+            [this](){ timerCallback(); }, cb_group_reentrant_);
 
         RCLCPP_INFO(get_logger(),
             "[OccupancyMapper] %.0fx%.0f m @ %.3f m/cell = %dx%d cells  fov=+/-%.0fdeg  localization=%s",
@@ -109,10 +119,10 @@ public:
 
 private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                           sub_trigger_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr                       sub_odom_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr                   sub_scan_;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_initial_pose_;
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr                     pub_map_;
-    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr                     pub_particle_cloud_;
     rclcpp::Client<graph_slam::srv::GetGraph>::SharedPtr                           clt_get_graph_;
     rclcpp::TimerBase::SharedPtr                                                   timer_;
     tf2_ros::TransformBroadcaster                                                  tf_broadcaster_{this};
@@ -120,11 +130,16 @@ private:
     tf2_ros::TransformListener                                                     tf_listener_;
     std::mt19937                                                                   rng_;
 
+    rclcpp::CallbackGroup::SharedPtr cb_group_reentrant_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_get_graph_;
+
     double map_resolution_;
     double map_width_m_, map_height_m_;
     int    width_cells_, height_cells_;
     double origin_x_, origin_y_;
     vector<double> log_odds_;
+    vector<int> hit_counts_;
+    vector<int> miss_counts_;
     double publish_period_sec_;
     double map_angle_step_deg_;
     double fov_half_deg_;
@@ -143,9 +158,10 @@ private:
     double map_odom_x_,  map_odom_y_,  map_odom_theta_;
     bool   odom_received_;
     bool   map_ready_;
-    bool   busy_;
 
     int last_mapped_node_ = -1;
+    double latest_odom_x_ = 0, latest_odom_y_ = 0, latest_odom_theta_ = 0;
+    bool   has_odom_ = false;
 
     void triggerCallback(std_msgs::msg::Bool::SharedPtr msg)
     {
@@ -155,10 +171,17 @@ private:
         }
     }
 
-    void timerCallback()
+    void odomCallback(nav_msgs::msg::Odometry::SharedPtr msg)
     {
-        incrementalUpdate();
-        broadcastMapTf();
+        latest_odom_x_ = msg->pose.pose.position.x;
+        latest_odom_y_ = msg->pose.pose.position.y;
+        tf2::Quaternion q(msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+                          msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
+        tf2::Matrix3x3 m(q);
+        double roll, pitch, yaw;
+        m.getRPY(roll, pitch, yaw);
+        latest_odom_theta_ = yaw;
+        has_odom_ = true;
     }
 
     void initialPoseCallback(geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
@@ -348,62 +371,62 @@ private:
                                         +T_map_odom.getRotation().z()*T_map_odom.getRotation().z()));
     }
 
+    void timerCallback()
+    {
+        incrementalUpdate();
+        broadcastMapTf();
+    }
+
     void fullRebuild()
     {
-        if (busy_) return;
-        busy_ = true;
+        fill(hit_counts_.begin(), hit_counts_.end(), 0);
+        fill(miss_counts_.begin(), miss_counts_.end(), 0);
 
         auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
-        clt_get_graph_->async_send_request(req,
-            [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture future)
-            {
-                auto resp = *(future.get());
-                int N = static_cast<int>(resp.ids.size());
-                if (N == 0) {
-                    RCLCPP_WARN(get_logger(), "[OccupancyMapper] Graph empty");
-                    busy_ = false;
-                    return;
-                }
+        auto future = clt_get_graph_->async_send_request(req);
+        auto status = future.wait_for(std::chrono::seconds(5));
+        if (status != std::future_status::ready) {
+            RCLCPP_ERROR(get_logger(), "[OccupancyMapper] get_graph failed");
+            return;
+        }
+        auto resp = future.get();
 
-                fill(log_odds_.begin(), log_odds_.end(), 0.0);
-                for (int i = 0; i < N; ++i)
-                    insertScan(resp.xs[i], resp.ys[i], resp.thetas[i], resp.scans[i]);
+        int N = static_cast<int>(resp->ids.size());
+        if (N == 0) { RCLCPP_WARN(get_logger(), "[OccupancyMapper] Graph empty"); return; }
 
-                last_mapped_node_ = N - 1;
-                map_ready_ = true;
-                publishMap();
-                RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild: %d nodes", N);
-                busy_ = false;
-            });
+        fill(log_odds_.begin(), log_odds_.end(), 0.0);
+        for (int i = 0; i < N; ++i)
+            insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
+
+        last_mapped_node_ = N - 1;
+        map_ready_ = true;
+        publishMap();
+        RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild: %d nodes", N);
     }
 
     void incrementalUpdate()
     {
-        if (busy_) return;
-        busy_ = true;
-
         auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
-        clt_get_graph_->async_send_request(req,
-            [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture future)
-            {
-                auto resp = *(future.get());
-                int N = static_cast<int>(resp.ids.size());
-                bool changed = false;
-                for (int i = last_mapped_node_ + 1; i < N; ++i) {
-                    insertScan(resp.xs[i], resp.ys[i], resp.thetas[i], resp.scans[i]);
-                    changed = true;
-                }
-                if (changed) {
-                    publishMap();
-                    last_mapped_node_ = N - 1;
-                    map_ready_ = true;
-                }
-                busy_ = false;
-            });
+        auto future = clt_get_graph_->async_send_request(req);
+        auto status = future.wait_for(std::chrono::seconds(5));
+        if (status != std::future_status::ready) return;
+        auto resp = future.get();
+
+        int N = static_cast<int>(resp->ids.size());
+        bool changed = false;
+        for (int i = last_mapped_node_ + 1; i < N; ++i)
+        {
+            insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
+            changed = true;
+        }
+        if (changed) {
+            publishMap();
+            last_mapped_node_ = N - 1;
+            map_ready_ = true;
+        }
     }
 
-    void insertScan(double x, double y, double theta,
-                    const sensor_msgs::msg::LaserScan& scan)
+    void insertScan(double x, double y, double theta, sensor_msgs::msg::LaserScan& scan)
     {
         if (scan.ranges.empty()) return;
 
@@ -411,28 +434,51 @@ private:
         int ry = worldToCell(y, false);
 
         double step_rad = map_angle_step_deg_ * M_PI / 180.0;
-        int    step     = max(1, static_cast<int>(step_rad / scan.angle_increment));
-        double fov_rad  = fov_half_deg_ * M_PI / 180.0;
+        int step = max(1, static_cast<int>(step_rad / scan.angle_increment));
 
-        int num_rays = static_cast<int>(scan.ranges.size());
-        for (int i = 0; i < num_rays; i += step) {
-            double angle  = scan.angle_min + i * scan.angle_increment;
-            double a_norm = fmod(angle + M_PI, 2.0 * M_PI) - M_PI;
+        double fov_rad = fov_half_deg_ * M_PI / 180.0;
+
+        double angle = scan.angle_min;
+        for (size_t i = 0; i < scan.ranges.size(); i += step, angle += step * scan.angle_increment)
+        {
+            double a_norm = fmod(angle + M_PI, 2*M_PI) - M_PI;
             if (fabs(a_norm) > fov_rad) continue;
 
             float r   = scan.ranges[i];
             bool  hit = isfinite(r) && r > scan.range_min && r < scan.range_max;
 
-            double global_angle = theta + angle;
+            double end_r = hit ? static_cast<double>(r) : scan.range_max;
+            double wx    = x + end_r * cos(theta + angle);
+            double wy    = y + end_r * sin(theta + angle);
 
-            if (hit) {
-                int ex = worldToCell(x + r * cos(global_angle), true);
-                int ey = worldToCell(y + r * sin(global_angle), false);
-                bresenham(rx, ry, ex, ey, true);
-            } else {
-                int ex = worldToCell(x + scan.range_max * cos(global_angle), true);
-                int ey = worldToCell(y + scan.range_max * sin(global_angle), false);
-                bresenham(rx, ry, ex, ey, false);
+            int ex = worldToCell(wx, true);
+            int ey = worldToCell(wy, false);
+
+            bresenham(rx, ry, ex, ey, hit);
+        }
+    }
+
+    void smearOccupied(int cx, int cy, int radius_cells, double delta)
+    {
+        for (int dx = -radius_cells; dx <= radius_cells; ++dx)
+        {
+            for (int dy = -radius_cells; dy <= radius_cells; ++dy)
+            {
+                int nx = cx + dx;
+                int ny = cy + dy;
+
+                if (nx < 0 || nx >= width_cells_ ||
+                    ny < 0 || ny >= height_cells_)
+                    continue;
+
+                if (dx*dx + dy*dy > radius_cells*radius_cells)
+                    continue;
+
+                int idx = ny * width_cells_ + nx;
+
+                log_odds_[idx] =
+                    min(max(log_odds_[idx] + delta, LOGODD_MIN),
+                        LOGODD_MAX);
             }
         }
     }
@@ -446,20 +492,35 @@ private:
         int f  = dx - dy;
         int x  = x0, y = y0;
 
-        while (true) {
+        while (true)
+        {
             if (x < 0 || x >= width_cells_ || y < 0 || y >= height_cells_) break;
-            if (x == x1 && y == y1) { updateCell(x, y, mark_hit ? LOGODD_HIT : LOGODD_MISS); break; }
-            updateCell(x, y, LOGODD_MISS);
+
+            if (x == x1 && y == y1)
+            {
+                if (mark_hit) {
+                    updateCell(x, y, LOGODD_HIT, true);
+                    smearOccupied(x, y, 2, LOGODD_HIT / 2.0);
+                }
+                break;
+            }
+
+            updateCell(x, y, LOGODD_MISS, false);
             int f2 = 2 * f;
             if (f2 > -dy) { f -= dy; x += sx; }
             if (f2 <  dx) { f += dx; y += sy; }
         }
     }
 
-    void updateCell(int x, int y, double delta)
+    void updateCell(int x, int y, double delta, bool is_hit=false)
     {
         int idx = y * width_cells_ + x;
         log_odds_[idx] = min(max(log_odds_[idx] + delta, LOGODD_MIN), LOGODD_MAX);
+        if (is_hit) {
+            hit_counts_[idx]++;
+        } else {
+            miss_counts_[idx]++;
+        }
     }
 
     int worldToCell(double coord, bool is_x)
@@ -481,8 +542,9 @@ private:
         grid.info.origin.orientation.w = 1.0;
 
         grid.data.resize(width_cells_ * height_cells_);
-        for (size_t i = 0; i < log_odds_.size(); ++i) {
-            if      (log_odds_[i] >  0.5) grid.data[i] = 100;
+        for (size_t i = 0; i < log_odds_.size(); ++i)
+        {
+            if      (log_odds_[i] >  1.0) grid.data[i] = 100;
             else if (log_odds_[i] < -0.5) grid.data[i] = 0;
             else                           grid.data[i] = -1;
         }
@@ -491,16 +553,63 @@ private:
 
     void broadcastMapTf()
     {
+        if (!has_odom_) return;
+        rclcpp::Time now = this->get_clock()->now();
+        if (now.nanoseconds() == 0) return;
+
+        if (localization_enabled_ && localization_initialized_) {
+            geometry_msgs::msg::TransformStamped ts;
+            ts.header.stamp    = now;
+            ts.header.frame_id = "map";
+            ts.child_frame_id  = odom_frame_;
+            ts.transform.translation.x = map_odom_x_;
+            ts.transform.translation.y = map_odom_y_;
+            ts.transform.rotation.z = sin(map_odom_theta_ / 2.0);
+            ts.transform.rotation.w = cos(map_odom_theta_ / 2.0);
+            tf_broadcaster_.sendTransform(ts);
+            return;
+        }
+
+        auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
+        auto future = clt_get_graph_->async_send_request(req);
+        auto status = future.wait_for(std::chrono::seconds(5));
+        if (status != std::future_status::ready) return;
+        auto resp = future.get();
+
+        int N = static_cast<int>(resp->ids.size());
+        if (N == 0) return;
+
+        double mx = resp->xs[N-1];
+        double my = resp->ys[N-1];
+        double mth = resp->thetas[N-1];
+
+        tf2::Transform T_map_base;
+        T_map_base.setOrigin(tf2::Vector3(mx, my, 0.0));
+        tf2::Quaternion qm; qm.setRPY(0.0, 0.0, mth);
+        T_map_base.setRotation(qm);
+
+        tf2::Transform T_odom_base;
+        T_odom_base.setOrigin(tf2::Vector3(latest_odom_x_, latest_odom_y_, 0.0));
+        tf2::Quaternion qo; qo.setRPY(0.0, 0.0, latest_odom_theta_);
+        T_odom_base.setRotation(qo);
+
+        tf2::Transform T_map_odom = T_map_base * T_odom_base.inverse();
+
+        double map_odom_x = T_map_odom.getOrigin().x();
+        double map_odom_y = T_map_odom.getOrigin().y();
+        double map_odom_th = atan2(2.0*(T_map_odom.getRotation().w()*T_map_odom.getRotation().z()
+                                       +T_map_odom.getRotation().x()*T_map_odom.getRotation().y()),
+                                  1.0-2.0*(T_map_odom.getRotation().y()*T_map_odom.getRotation().y()
+                                          +T_map_odom.getRotation().z()*T_map_odom.getRotation().z()));
+
         geometry_msgs::msg::TransformStamped ts;
-        ts.header.stamp    = this->get_clock()->now();
+        ts.header.stamp    = now;
         ts.header.frame_id = "map";
         ts.child_frame_id  = odom_frame_;
-        ts.transform.translation.x = map_odom_x_;
-        ts.transform.translation.y = map_odom_y_;
-        ts.transform.translation.z = 0.0;
-        tf2::Quaternion q;
-        q.setRPY(0.0, 0.0, map_odom_theta_);
-        ts.transform.rotation = tf2::toMsg(q);
+        ts.transform.translation.x = map_odom_x;
+        ts.transform.translation.y = map_odom_y;
+        ts.transform.rotation.z = sin(map_odom_th / 2.0);
+        ts.transform.rotation.w = cos(map_odom_th / 2.0);
         tf_broadcaster_.sendTransform(ts);
     }
 };
@@ -511,7 +620,9 @@ int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<graph_slam::OccupancyMapper>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

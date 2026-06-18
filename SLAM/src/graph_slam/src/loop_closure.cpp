@@ -3,7 +3,6 @@
 #include <graph_slam/srv/add_edge.hpp>
 #include <graph_slam/srv/scan_match.hpp>
 #include "types.hpp"
-
 #include <cmath>
 #include <map>
 #include <set>
@@ -12,16 +11,12 @@
 #include <algorithm>
 #include <limits>
 #include <Eigen/Dense>
-
 using namespace std;
 namespace graph_slam {
-
 static const int NR = 20;
 static const int NS = 60;
-
 using SCMatrix = Eigen::Matrix<double, NR, NS>;
-
-SCMatrix buildScanContext(const sensor_msgs::msg::LaserScan& scan, double max_range)
+SCMatrix buildScanContext(sensor_msgs::msg::LaserScan scan, double max_range)
 {
     SCMatrix sc = SCMatrix::Zero();
     double ring_width   = max_range / NR;
@@ -30,18 +25,17 @@ SCMatrix buildScanContext(const sensor_msgs::msg::LaserScan& scan, double max_ra
     for (size_t i = 0; i < scan.ranges.size(); ++i, angle += scan.angle_increment)
     {
         double r = scan.ranges[i];
-        if (!isfinite(r) || r <= scan.range_min || r >= scan.range_max || r > max_range)
+        if (!std::isfinite(r) || r <= scan.range_min || r >= scan.range_max || r > max_range)
             continue;
-        int ring = min(static_cast<int>(r / ring_width), NR - 1);
+        int ring = std::min(static_cast<int>(r / ring_width), NR - 1);
         double a = fmod(angle, 2.0 * M_PI);
         if (a < 0.0) a += 2.0 * M_PI;
-        int sec = min(static_cast<int>(a / sector_width), NS - 1);
+        int sec = std::min(static_cast<int>(a / sector_width), NS - 1);
         if (r > sc(ring, sec)) sc(ring, sec) = r;
     }
     return sc;
 }
-
-pair<double, int> scanContextDistance(const SCMatrix& A, const SCMatrix& B)
+pair<double, int> scanContextDistance(SCMatrix A, SCMatrix B)
 {
     SCMatrix A_hat = SCMatrix::Zero();
     SCMatrix B_hat = SCMatrix::Zero();
@@ -52,65 +46,70 @@ pair<double, int> scanContextDistance(const SCMatrix& A, const SCMatrix& B)
         if (na > 1e-9) A_hat.col(j) = A.col(j) / na;
         if (nb > 1e-9) B_hat.col(j) = B.col(j) / nb;
     }
-
     double best_dist  = 2.0;
     int    best_shift = 0;
     for (int phi = 0; phi < NS; ++phi)
     {
         double cosine_sum = 0.0;
         for (int j = 0; j < NS; ++j)
-            cosine_sum += A_hat.col(j).dot(B_hat.col((j + phi) % NS));
+        {
+            int j_shifted = (j + phi) % NS;
+            cosine_sum += A_hat.col(j).dot(B_hat.col(j_shifted));
+        }
         double dist = 1.0 - cosine_sum / static_cast<double>(NS);
         if (dist < best_dist) { best_dist = dist; best_shift = phi; }
     }
     return { best_dist, best_shift };
 }
-
-
-
 class LoopClosure : public rclcpp::Node
 {
 public:
     LoopClosure() : Node("loop_closure")
     {
-        max_range_           = declare_parameter("max_range",           3.0);
-        min_node_separation_ = declare_parameter("min_node_separation", 40);
-        num_candidates_      = declare_parameter("num_candidates",      5);
-        sc_threshold_        = declare_parameter("sc_threshold",        0.15);
-        icp_threshold_       = declare_parameter("icp_threshold",       0.02);
-        max_lc_per_tick_     = declare_parameter("max_lc_per_tick",     1);
-        period_sec_          = declare_parameter("period_sec",          8.0);
-        max_icp_translation_ = declare_parameter("max_icp_translation", 0.5);
-        query_window_        = declare_parameter("query_window",        5);
-        max_euclidean_dist_  = declare_parameter("max_euclidean_dist",  3.0);
+        max_range_           = declare_parameter("max_range",             20.0);
+        min_node_separation_ = declare_parameter("min_node_separation",   15);
+        num_candidates_      = declare_parameter("num_candidates",        10);
+        sc_threshold_        = declare_parameter("sc_threshold",          0.35);
+        icp_threshold_       = declare_parameter("icp_threshold",         0.05);
+        max_lc_per_tick_     = declare_parameter("max_lc_per_tick",       3);
+        period_sec_          = declare_parameter("period_sec",            5.0);
+        max_icp_translation_ = declare_parameter("max_icp_translation",   2.0);
+        query_window_        = declare_parameter("query_window",          10);
 
-        clt_graph_ = create_client<graph_slam::srv::GetGraph>("/graph_slam/get_graph");
-        clt_edge_  = create_client<graph_slam::srv::AddEdge> ("/graph_slam/add_edge");
-        clt_icp_   = create_client<graph_slam::srv::ScanMatch>("/graph_slam/scan_match");
+        cb_group_reentrant_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        cb_group_graph_     = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cb_group_edge_      = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cb_group_icp_       = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
+        clt_graph_ = create_client<graph_slam::srv::GetGraph> ("graph_slam/get_graph",  rmw_qos_profile_services_default, cb_group_graph_);
+        clt_edge_  = create_client<graph_slam::srv::AddEdge>  ("graph_slam/add_edge",   rmw_qos_profile_services_default, cb_group_edge_);
+        clt_icp_   = create_client<graph_slam::srv::ScanMatch>("graph_slam/scan_match", rmw_qos_profile_services_default, cb_group_icp_);
         clt_graph_->wait_for_service();
         clt_edge_->wait_for_service();
         clt_icp_->wait_for_service();
 
-        busy_ = false;
-
         timer_ = create_wall_timer(
             std::chrono::duration<double>(period_sec_),
-            std::bind(&LoopClosure::tick, this));
+            std::bind(&LoopClosure::tick, this),
+            cb_group_reentrant_);
 
         RCLCPP_INFO(get_logger(),
             "[LoopClosure] max_range=%.1f  min_sep=%d  candidates=%d  "
-            "sc_thr=%.2f  icp_thr=%.2f  max_lc=%d  query_window=%d  max_trans=%.1f  max_euc=%.1f",
+            "sc_thr=%.2f  icp_thr=%.2f  max_lc=%d  query_window=%d  max_trans=%.1f",
             max_range_, min_node_separation_, num_candidates_,
             sc_threshold_, icp_threshold_, max_lc_per_tick_,
-            query_window_, max_icp_translation_, max_euclidean_dist_);
+            query_window_, max_icp_translation_);
     }
-
 private:
     rclcpp::Client<graph_slam::srv::GetGraph>::SharedPtr  clt_graph_;
     rclcpp::Client<graph_slam::srv::AddEdge>::SharedPtr   clt_edge_;
     rclcpp::Client<graph_slam::srv::ScanMatch>::SharedPtr clt_icp_;
     rclcpp::TimerBase::SharedPtr timer_;
+
+    rclcpp::CallbackGroup::SharedPtr cb_group_reentrant_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_graph_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_edge_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_icp_;
 
     double max_range_;
     int    min_node_separation_;
@@ -121,14 +120,12 @@ private:
     double period_sec_;
     double max_icp_translation_;
     int    query_window_;
-    double max_euclidean_dist_;
-    bool   busy_;
 
     vector<SCMatrix>                     sc_cache_;
     vector<Eigen::Matrix<double, NR, 1>> rk_cache_;
-    set<pair<int,int>>                   added_lc_pairs_;
+    map<pair<int,int>, rclcpp::Time>     added_lc_pairs_;
 
-    static Eigen::Matrix<double, NR, 1> ringKey(const SCMatrix& sc)
+    static Eigen::Matrix<double, NR, 1> ringKey(SCMatrix& sc)
     {
         Eigen::Matrix<double, NR, 1> k;
         for (int i = 0; i < NR; ++i)
@@ -141,249 +138,153 @@ private:
         return k;
     }
 
-    void updateCaches(const vector<PoseNode>& nodes)
+    void updateCaches(vector<PoseNode>& nodes)
     {
         for (int i = static_cast<int>(sc_cache_.size());
-             i < static_cast<int>(nodes.size()); ++i)
+                 i < static_cast<int>(nodes.size()); ++i)
         {
             sc_cache_.push_back(buildScanContext(nodes[i].scan, max_range_));
             rk_cache_.push_back(ringKey(sc_cache_.back()));
         }
     }
 
-    vector<int> ringKeyTopK(int q, int ref_limit, const vector<PoseNode>& nodes)
+    vector<int> ringKeyTopK(int q, int num_refs)
     {
         struct Hit { int ref; double dist; };
         vector<Hit> hits;
-        hits.reserve(ref_limit);
-
-        for (int ref = 0; ref < ref_limit; ++ref)
+        hits.reserve(num_refs);
+        for (int ref = 0; ref < num_refs; ++ref)
         {
-            double edx = nodes[q].x - nodes[ref].x;
-            double edy = nodes[q].y - nodes[ref].y;
-            double euc = sqrt(edx*edx + edy*edy);
-            if (euc > max_euclidean_dist_) continue;
-
             double d = (rk_cache_[q] - rk_cache_[ref]).norm();
             hits.push_back({ ref, d });
         }
-
         int K = min(num_candidates_, static_cast<int>(hits.size()));
-        if (K <= 0) return {};
         partial_sort(hits.begin(), hits.begin() + K, hits.end(),
-                     [](const Hit& a, const Hit& b) { return a.dist < b.dist; });
-
+                         [](Hit& a, Hit& b) { return a.dist < b.dist; });
         vector<int> topk;
         topk.reserve(K);
         for (int i = 0; i < K; ++i) topk.push_back(hits[i].ref);
         return topk;
     }
 
-    struct CandidateHit {
-        int    ref;
-        double sc_dist;
-        double init_dtheta_sc;
-    };
-
-    vector<CandidateHit> buildVerifiedCandidates(int q, int ref_limit,
-                                                  const vector<PoseNode>& nodes)
+    bool tryLoopClosure(int q, int num_refs, vector<PoseNode>& nodes)
     {
-        vector<int> candidates = ringKeyTopK(q, ref_limit, nodes);
-        vector<CandidateHit> verified;
-        verified.reserve(candidates.size());
+        vector<int> candidates = ringKeyTopK(q, num_refs);
+        double best_sc    = numeric_limits<double>::max();
+        int    best_ref   = -1;
         for (int ref : candidates)
         {
             auto [sc_dist, shift] = scanContextDistance(sc_cache_[q], sc_cache_[ref]);
-            if (sc_dist >= sc_threshold_) continue;
-            double shift_rad = shift * (2.0 * M_PI / NS);
-            verified.push_back({ ref, sc_dist, shift_rad });
+            if (sc_dist < best_sc) { best_sc = sc_dist; best_ref = ref; }
         }
-        sort(verified.begin(), verified.end(),
-             [](const CandidateHit& a, const CandidateHit& b){ return a.sc_dist < b.sc_dist; });
-        return verified;
-    }
+        if (best_ref < 0 || best_sc >= sc_threshold_) return false;
 
-    void tryNextCandidate(int q,
-                          vector<PoseNode> nodes,
-                          vector<CandidateHit> candidates,
-                          int candidate_idx,
-                          int lc_added,
-                          int lc_added_total)
-    {
-        if (candidate_idx >= static_cast<int>(candidates.size()) ||
-            lc_added >= max_lc_per_tick_)
-        {
-            tryNextQuery(q + 1, nodes, lc_added_total);
-            return;
+        auto lc_pair = make_pair(nodes[best_ref].id, nodes[q].id);
+        auto it = added_lc_pairs_.find(lc_pair);
+        if (it != added_lc_pairs_.end()) {
+            if ((this->get_clock()->now() - it->second).seconds() < 60.0) return false;
         }
 
-        auto& hit = candidates[candidate_idx];
-        int ref = hit.ref;
-
-        auto lc_pair = make_pair(min(nodes[ref].id, nodes[q].id),
-                                 max(nodes[ref].id, nodes[q].id));
-        if (added_lc_pairs_.count(lc_pair))
-        {
-            tryNextCandidate(q, nodes, candidates, candidate_idx + 1, lc_added, lc_added_total);
-            return;
-        }
-
-        double wdx = nodes[q].x - nodes[ref].x;
-        double wdy = nodes[q].y - nodes[ref].y;
-        double cr  = cos(nodes[ref].theta);
-        double sr  = sin(nodes[ref].theta);
-
-        double odom_dtheta = wrapAngle(nodes[q].theta - nodes[ref].theta);
-        double sc_dtheta   = wrapAngle(-hit.init_dtheta_sc);
-        double init_dtheta = (fabs(wrapAngle(odom_dtheta - sc_dtheta)) < M_PI / 2.0)
-                              ? sc_dtheta : odom_dtheta;
+        double wdx = nodes[q].x - nodes[best_ref].x;
+        double wdy = nodes[q].y - nodes[best_ref].y;
+        double cr  = cos(nodes[best_ref].theta);
+        double sr  = sin(nodes[best_ref].theta);
 
         auto sm_req = std::make_shared<graph_slam::srv::ScanMatch::Request>();
-        sm_req->reference_scan = nodes[ref].scan;
+        sm_req->reference_scan = nodes[best_ref].scan;
         sm_req->current_scan   = nodes[q].scan;
         sm_req->init_dx        =  cr * wdx + sr * wdy;
         sm_req->init_dy        = -sr * wdx + cr * wdy;
-        sm_req->init_dtheta    = init_dtheta;
+        sm_req->init_dtheta    = wrapAngle(nodes[q].theta - nodes[best_ref].theta);
 
-        clt_icp_->async_send_request(sm_req,
-            [this, q, nodes, candidates, candidate_idx, lc_added, lc_added_total,
-             ref, hit, lc_pair](rclcpp::Client<graph_slam::srv::ScanMatch>::SharedFuture sm_future)
-            {
-                auto sm_res = sm_future.get();
+        auto sm_future = clt_icp_->async_send_request(sm_req);
+        auto sm_status = sm_future.wait_for(std::chrono::seconds(5));
+        if (sm_status != std::future_status::ready) return false;
+        auto sm_res = sm_future.get();
+        if (!sm_res->success) return false;
+        if (sm_res->score > icp_threshold_) return false;
 
-                if (!sm_res->success || sm_res->score > icp_threshold_)
-                {
-                    tryNextCandidate(q, nodes, candidates, candidate_idx + 1, lc_added, lc_added_total);
-                    return;
-                }
-
-                double icp_trans = sqrt(sm_res->dx * sm_res->dx + sm_res->dy * sm_res->dy);
-                if (icp_trans > max_icp_translation_)
-                {
-                    RCLCPP_DEBUG(get_logger(), "[LC] REJECTED implausible translation %.2fm  %d<->%d",
-                                 icp_trans, nodes[ref].id, nodes[q].id);
-                    tryNextCandidate(q, nodes, candidates, candidate_idx + 1, lc_added, lc_added_total);
-                    return;
-                }
-
-                double angle_change = fabs(wrapAngle(sm_res->dtheta));
-                if (angle_change > M_PI / 3.0)
-                {
-                    RCLCPP_DEBUG(get_logger(), "[LC] REJECTED large rotation %.1fdeg  %d<->%d",
-                                 angle_change * 180.0 / M_PI, nodes[ref].id, nodes[q].id);
-                    tryNextCandidate(q, nodes, candidates, candidate_idx + 1, lc_added, lc_added_total);
-                    return;
-                }
-
-                auto ae_req = std::make_shared<graph_slam::srv::AddEdge::Request>();
-                ae_req->from_id = nodes[ref].id;
-                ae_req->to_id   = nodes[q].id;
-                ae_req->type    = Edge::LOOP_CLOSURE;
-                ae_req->dx      = sm_res->dx;
-                ae_req->dy      = sm_res->dy;
-                ae_req->dtheta  = sm_res->dtheta;
-                for (int r = 0; r < 3; ++r)
-                    for (int c = 0; c < 3; ++c)
-                        ae_req->information.push_back(sm_res->information[r * 3 + c]);
-
-                clt_edge_->async_send_request(ae_req,
-                    [this, q, nodes, candidates, candidate_idx, lc_added, lc_added_total,
-                     ref, hit, lc_pair, icp_trans, angle_change, sm_res](
-                        rclcpp::Client<graph_slam::srv::AddEdge>::SharedFuture ae_future)
-                    {
-                        auto ae_res = ae_future.get();
-                        int new_lc_added = lc_added;
-                        int new_total    = lc_added_total;
-
-                        if (ae_res->success)
-                        {
-                            added_lc_pairs_.insert(lc_pair);
-                            ++new_lc_added;
-                            ++new_total;
-                            RCLCPP_INFO(get_logger(),
-                                "[LC] ACCEPTED  %d <-> %d   sc=%.3f  icp=%.4f  trans=%.3fm  rot=%.1fdeg",
-                                nodes[ref].id, nodes[q].id,
-                                hit.sc_dist, sm_res->score, icp_trans, angle_change * 180.0 / M_PI);
-                        }
-
-                        tryNextCandidate(q, nodes, candidates, candidate_idx + 1,
-                                         new_lc_added, new_total);
-                    });
-            });
-    }
-
-    void tryNextQuery(int q, vector<PoseNode> nodes, int lc_added_total)
-    {
-        int N       = static_cast<int>(nodes.size());
-        int q_end   = N;
-
-        if (q >= q_end || lc_added_total >= max_lc_per_tick_)
+        double icp_trans = sqrt(sm_res->dx * sm_res->dx + sm_res->dy * sm_res->dy);
+        if (icp_trans > max_icp_translation_)
         {
-            if (lc_added_total > 0)
-                RCLCPP_INFO(get_logger(), "[LC] Added %d loop closure(s) this tick.", lc_added_total);
-            busy_ = false;
-            return;
+            RCLCPP_DEBUG(get_logger(), "[LC] REJECTED implausible translation: %.2fm > %.2fm",
+                          icp_trans, max_icp_translation_);
+            return false;
         }
 
-        int ref_limit = q - min_node_separation_;
-        if (ref_limit <= 0)
-        {
-            tryNextQuery(q + 1, nodes, lc_added_total);
-            return;
-        }
+        auto ae_req = std::make_shared<graph_slam::srv::AddEdge::Request>();
+        ae_req->from_id = nodes[best_ref].id;
+        ae_req->to_id   = nodes[q].id;
+        ae_req->type    = Edge::LOOP_CLOSURE;
+        ae_req->dx      = sm_res->dx;
+        ae_req->dy      = sm_res->dy;
+        ae_req->dtheta  = sm_res->dtheta;
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                ae_req->information.push_back(sm_res->information[r * 3 + c]);
 
-        auto candidates = buildVerifiedCandidates(q, ref_limit, nodes);
-        if (candidates.empty())
+        auto ae_future = clt_edge_->async_send_request(ae_req);
+        auto ae_status = ae_future.wait_for(std::chrono::seconds(5));
+        if (ae_status != std::future_status::ready) return false;
+        auto ae_res = ae_future.get();
+        if (ae_res->success)
         {
-            tryNextQuery(q + 1, nodes, lc_added_total);
-            return;
+            added_lc_pairs_[lc_pair] = this->get_clock()->now();
+            RCLCPP_INFO(get_logger(), "[LC] ACCEPTED  %d <-> %d   sc=%.3f  icp=%.4f  trans=%.3fm",
+                         nodes[best_ref].id, nodes[q].id,
+                         best_sc, sm_res->score, icp_trans);
+            return true;
         }
-
-        tryNextCandidate(q, nodes, candidates, 0, 0, lc_added_total);
+        return false;
     }
 
     void tick()
     {
-        if (busy_) return;
-        busy_ = true;
-
         auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
-        clt_graph_->async_send_request(req,
-            [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture future)
-            {
-                auto srv = future.get();
-                int N = static_cast<int>(srv->ids.size());
-                if (N < min_node_separation_ + 2)
-                {
-                    busy_ = false;
-                    return;
-                }
+        auto future = clt_graph_->async_send_request(req);
+        auto status = future.wait_for(std::chrono::seconds(5));
+        if (status != std::future_status::ready) return;
+        auto srv_response = future.get();
 
-                vector<PoseNode> nodes(N);
-                for (int i = 0; i < N; ++i)
-                {
-                    nodes[i].id    = srv->ids[i];
-                    nodes[i].x     = srv->xs[i];
-                    nodes[i].y     = srv->ys[i];
-                    nodes[i].theta = srv->thetas[i];
-                    nodes[i].scan  = srv->scans[i];
-                }
+        int N = static_cast<int>(srv_response->ids.size());
+        if (N < min_node_separation_ + 2) return;
 
-                updateCaches(nodes);
+        vector<PoseNode> nodes(N);
+        for (int i = 0; i < N; ++i)
+        {
+            nodes[i].id    = srv_response->ids[i];
+            nodes[i].x     = srv_response->xs[i];
+            nodes[i].y     = srv_response->ys[i];
+            nodes[i].theta = srv_response->thetas[i];
+            nodes[i].scan  = srv_response->scans[i];
+        }
 
-                int q_start = max(min_node_separation_ + 1, N - query_window_);
-                tryNextQuery(q_start, nodes, 0);
-            });
+        updateCaches(nodes);
+
+        int lc_added = 0;
+        int q_start = max(min_node_separation_ + 1, N - query_window_);
+
+        for (int q = q_start; q < N && lc_added < max_lc_per_tick_; ++q)
+        {
+            int num_refs = q - min_node_separation_;
+            if (num_refs <= 0) continue;
+            if (tryLoopClosure(q, num_refs, nodes))
+                ++lc_added;
+        }
+
+        if (lc_added > 0)
+            RCLCPP_INFO(get_logger(), "[LC] Added %d loop closure(s) this tick.", lc_added);
     }
 };
-
 }
 
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<graph_slam::LoopClosure>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

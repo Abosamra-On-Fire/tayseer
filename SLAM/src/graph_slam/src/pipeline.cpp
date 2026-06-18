@@ -9,7 +9,6 @@
 #include "graph_slam/srv/scan_match.hpp"
 
 #include "types.hpp"
-#include <Eigen/Dense>
 #include <cmath>
 
 using namespace std;
@@ -26,7 +25,7 @@ double scanDegeneracy(const sensor_msgs::msg::LaserScan& scan)
         pts.push_back({r*cos(angle), r*sin(angle)});
         mx += pts.back().first; my += pts.back().second; ++N;
     }
-    if (N < 5) return 0.0;
+    if (N < 5) return 1.0;
     mx /= N; my /= N;
     double sxx = 0, sxy = 0, syy = 0;
     for (auto& p : pts) {
@@ -44,38 +43,39 @@ double scanDegeneracy(const sensor_msgs::msg::LaserScan& scan)
 class Pipeline : public rclcpp::Node
 {
 public:
-    explicit Pipeline()
+    Pipeline()
     : Node("graph_pipeline"), initialized_(false), last_node_id_(-1)
     {
-        min_dist_m_          = declare_parameter<double>("min_dist_m",                   0.3);
-        min_angle_deg_       = declare_parameter<double>("min_angle_deg",                30.0);
-        use_icp_odom_        = declare_parameter<bool>  ("use_scan_matching_from_odom",  true);
-        fallback_odom_       = declare_parameter<bool>  ("fallback_to_odom_on_icp_fail", true);
-        corridor_degen_thr_  = declare_parameter<double>("corridor_degeneracy_thr",      0.05);
-        icp_score_threshold_ = declare_parameter<double>("icp_score_threshold",          0.05);
+        min_dist_m_         = this->declare_parameter("min_dist_m",                   0.3);
+        min_angle_deg_      = this->declare_parameter("min_angle_deg",                30.0);
+        use_icp_odom_       = this->declare_parameter("use_scan_matching_from_odom",  true);
+        fallback_odom_      = this->declare_parameter("fallback_to_odom_on_icp_fail", true);
+        corridor_degen_thr_ = this->declare_parameter("corridor_degeneracy_thr",      0.08);
 
         min_angle_rad_ = min_angle_deg_ * M_PI / 180.0;
 
-        sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
-            "/odom", 50,
-            [this](nav_msgs::msg::Odometry::SharedPtr msg){ odomCallback(msg); });
+        cb_group_reentrant_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        cb_group_add_node_  = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cb_group_add_edge_  = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cb_group_scan_match_= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
-        sub_scan_ = create_subscription<sensor_msgs::msg::LaserScan>(
-            "limo/scan", 10,
-            [this](sensor_msgs::msg::LaserScan::SharedPtr msg){ scanCallback(msg); });
+        rclcpp::SubscriptionOptions sub_opts;
+        sub_opts.callback_group = cb_group_reentrant_;
 
-        clt_add_node_   = create_client<graph_slam::srv::AddNode>  ("graph_slam/add_node");
-        clt_add_edge_   = create_client<graph_slam::srv::AddEdge>  ("graph_slam/add_edge");
-        clt_scan_match_ = create_client<graph_slam::srv::ScanMatch>("graph_slam/scan_match");
+        sub_odom_ = this->create_subscription<nav_msgs::msg::Odometry>("/odom", 50,
+            std::bind(&Pipeline::odomCallback, this, std::placeholders::_1), sub_opts);
+        sub_scan_ = this->create_subscription<sensor_msgs::msg::LaserScan>("limo/scan", 10,
+            std::bind(&Pipeline::scanCallback, this, std::placeholders::_1), sub_opts);
 
+        clt_add_node_   = this->create_client<graph_slam::srv::AddNode>  ("graph_slam/add_node",   rmw_qos_profile_services_default, cb_group_add_node_);
+        clt_add_edge_   = this->create_client<graph_slam::srv::AddEdge>  ("graph_slam/add_edge",   rmw_qos_profile_services_default, cb_group_add_edge_);
+        clt_scan_match_ = this->create_client<graph_slam::srv::ScanMatch>("graph_slam/scan_match", rmw_qos_profile_services_default, cb_group_scan_match_);
         clt_add_node_->wait_for_service();
         clt_add_edge_->wait_for_service();
         clt_scan_match_->wait_for_service();
 
-        RCLCPP_INFO(get_logger(),
-            "[Pipeline] min_dist=%.2fm min_angle=%.1fdeg icp=%d fallback=%d corridor_thr=%.2f icp_score_thr=%.3f",
-            min_dist_m_, min_angle_deg_, use_icp_odom_, fallback_odom_,
-            corridor_degen_thr_, icp_score_threshold_);
+        RCLCPP_INFO(this->get_logger(), "[Pipeline] min_dist=%.2fm min_angle=%.1fdeg icp=%d fallback=%d corridor_thr=%.2f",
+                 min_dist_m_, min_angle_deg_, use_icp_odom_, fallback_odom_, corridor_degen_thr_);
     }
 
 private:
@@ -90,34 +90,23 @@ private:
     double min_dist_m_, min_angle_deg_, min_angle_rad_;
     bool   use_icp_odom_, fallback_odom_;
     double corridor_degen_thr_;
-    double icp_score_threshold_;
     double odom_cov_x_ = 0.0001, odom_cov_y_ = 0.0001, odom_cov_th_ = 0.001;
 
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr    sub_odom_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_reentrant_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_add_node_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_add_edge_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_scan_match_;
+
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr     sub_odom_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_scan_;
     rclcpp::Client<graph_slam::srv::AddNode>::SharedPtr          clt_add_node_;
     rclcpp::Client<graph_slam::srv::AddEdge>::SharedPtr          clt_add_edge_;
     rclcpp::Client<graph_slam::srv::ScanMatch>::SharedPtr        clt_scan_match_;
 
-    template<typename ClientT, typename RequestT>
-    typename ClientT::element_type::Response::SharedPtr callSync(
-        ClientT& client, typename RequestT::SharedPtr req)
-    {
-        auto future = client->async_send_request(req);
-        if (rclcpp::spin_until_future_complete(
-                this->get_node_base_interface(), future)
-            != rclcpp::FutureReturnCode::SUCCESS)
-            return nullptr;
-        return future.get();
-    }
+    void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+    { current_scan_ = *msg; has_scan_ = true; }
 
-    void scanCallback(sensor_msgs::msg::LaserScan::SharedPtr msg)
-    {
-        current_scan_ = *msg;
-        has_scan_ = true;
-    }
-
-    void odomCallback(nav_msgs::msg::Odometry::SharedPtr msg)
+    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
         tf2::Quaternion q(msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
                           msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
@@ -132,9 +121,9 @@ private:
         double cx = msg->pose.covariance[0];
         double cy = msg->pose.covariance[7];
         double ct = msg->pose.covariance[35];
-        odom_cov_x_  = (cx > 1e-9) ? cx : 0.0001;
-        odom_cov_y_  = (cy > 1e-9) ? cy : 0.0001;
-        odom_cov_th_ = (ct > 1e-9) ? ct : 0.001;
+        odom_cov_x_  = (cx  > 1e-9) ? cx  : 0.0001;
+        odom_cov_y_  = (cy  > 1e-9) ? cy  : 0.0001;
+        odom_cov_th_ = (ct  > 1e-9) ? ct  : 0.001;
 
         if (!initialized_) { tryInitialize(); return; }
 
@@ -149,7 +138,6 @@ private:
     void tryInitialize()
     {
         if (!has_scan_) return;
-
         auto req = std::make_shared<graph_slam::srv::AddNode::Request>();
         req->x         = current_x_;
         req->y         = current_y_;
@@ -157,19 +145,22 @@ private:
         req->scan      = current_scan_;
         req->timestamp = this->get_clock()->now().seconds();
 
-        auto res = callSync<decltype(clt_add_node_),
-                            graph_slam::srv::AddNode::Request>(clt_add_node_, req);
+        auto future = clt_add_node_->async_send_request(req);
+        auto status = future.wait_for(std::chrono::seconds(5));
+        if (status != std::future_status::ready) {
+            RCLCPP_ERROR(this->get_logger(), "[Pipeline] Failed to add first node");
+            return;
+        }
+        auto res = future.get();
 
-        if (res && res->success) {
+        if (res->success) {
             last_node_id_ = res->id;
             last_x_ = current_x_; last_y_ = current_y_; last_theta_ = current_theta_;
             last_scan_ = current_scan_;
             initialized_ = true;
-            RCLCPP_INFO(get_logger(), "[Pipeline] First node %d at (%.2f,%.2f,%.1fdeg)",
-                        last_node_id_, current_x_, current_y_, current_theta_*180/M_PI);
-        } else {
-            RCLCPP_ERROR(get_logger(), "[Pipeline] Failed to add first node");
-        }
+            RCLCPP_INFO(this->get_logger(), "[Pipeline] First node %d at (%.2f,%.2f,%.1fdeg)",
+                     last_node_id_, current_x_, current_y_, current_theta_*180/M_PI);
+        } else RCLCPP_ERROR(this->get_logger(), "[Pipeline] Failed to add first node");
     }
 
     void createKeyframe()
@@ -183,11 +174,14 @@ private:
         node_req->scan      = current_scan_;
         node_req->timestamp = this->get_clock()->now().seconds();
 
-        auto node_res = callSync<decltype(clt_add_node_),
-                                 graph_slam::srv::AddNode::Request>(clt_add_node_, node_req);
-
-        if (!node_res || !node_res->success) {
-            RCLCPP_ERROR(get_logger(), "[Pipeline] add_node failed"); return;
+        auto node_future = clt_add_node_->async_send_request(node_req);
+        auto node_status = node_future.wait_for(std::chrono::seconds(5));
+        if (node_status != std::future_status::ready) {
+            RCLCPP_ERROR(this->get_logger(), "[Pipeline] add_node failed"); return;
+        }
+        auto node_res = node_future.get();
+        if (!node_res->success) {
+            RCLCPP_ERROR(this->get_logger(), "[Pipeline] add_node failed"); return;
         }
         int new_id = node_res->id;
 
@@ -211,21 +205,22 @@ private:
             sm_req->init_dy        = kf_dy;
             sm_req->init_dtheta    = kf_dth;
 
-            auto sm_res = callSync<decltype(clt_scan_match_),
-                                   graph_slam::srv::ScanMatch::Request>(clt_scan_match_, sm_req);
+            auto sm_future = clt_scan_match_->async_send_request(sm_req);
+            auto sm_status = sm_future.wait_for(std::chrono::seconds(5));
+            bool sm_call_ok = (sm_status == std::future_status::ready);
+            std::shared_ptr<graph_slam::srv::ScanMatch::Response> sm_res;
+            if (sm_call_ok) sm_res = sm_future.get();
 
-            if (sm_res && sm_res->success && sm_res->score <= icp_score_threshold_) {
+            if (sm_call_ok && sm_res->success) {
                 double degen       = scanDegeneracy(current_scan_);
                 bool   in_corridor = (degen < corridor_degen_thr_);
 
                 if (in_corridor) {
-                    kf_dx  = sm_res->dx;
                     kf_dth = sm_res->dtheta;
-                    information(0,0) = 1.0 / max(odom_cov_x_, 1e-6);
-                    information(1,1) = 1.0 / max(odom_cov_y_, 1e-6);
-                    information(2,2) = min(1.0 / max(sm_res->score, 1e-6) * 0.3, 300.0);
-                    RCLCPP_DEBUG(get_logger(),
-                        "[Pipeline] Corridor: ICP dx+rot, odom dy, degen=%.3f", degen);
+                    information(0,0) = 1.0 / odom_cov_x_;
+                    information(1,1) = 1.0 / odom_cov_y_;
+                    information(2,2) = min(1.0 / max(sm_res->score, 1e-6) * 0.5, 500.0);
+                    RCLCPP_DEBUG(this->get_logger(), "[Pipeline] Corridor: odom trans + ICP rot, degen=%.3f", degen);
                 } else {
                     kf_dx  = sm_res->dx;
                     kf_dy  = sm_res->dy;
@@ -236,53 +231,56 @@ private:
                 }
                 icp_ok = true;
             } else {
-                if (!fallback_odom_) {
-                    RCLCPP_WARN(get_logger(), "[Pipeline] ICP failed/poor, skipping"); return;
-                }
-                RCLCPP_WARN(get_logger(), "[Pipeline] ICP failed or poor score, using odometry");
-                information(0,0) = 1.0 / max(odom_cov_x_, 1e-6);
-                information(1,1) = 1.0 / max(odom_cov_y_, 1e-6);
-                information(2,2) = 1.0 / max(odom_cov_th_, 1e-6);
+                if (!fallback_odom_) { RCLCPP_WARN(this->get_logger(), "[Pipeline] ICP failed, skipping"); return; }
+                RCLCPP_WARN(this->get_logger(), "[Pipeline] ICP failed, using odometry");
+                information(0,0) = 1.0 / odom_cov_x_;
+                information(1,1) = 1.0 / odom_cov_y_;
+                information(2,2) = 1.0 / odom_cov_th_;
             }
         } else {
-            information(0,0) = 1.0 / max(odom_cov_x_, 1e-6);
-            information(1,1) = 1.0 / max(odom_cov_y_, 1e-6);
-            information(2,2) = 1.0 / max(odom_cov_th_, 1e-6);
+            information(0,0) = 1.0 / odom_cov_x_;
+            information(1,1) = 1.0 / odom_cov_y_;
+            information(2,2) = 1.0 / odom_cov_th_;
         }
 
         auto edge_req = std::make_shared<graph_slam::srv::AddEdge::Request>();
-        edge_req->from_id = last_node_id_;
-        edge_req->to_id   = new_id;
-        edge_req->type    = Edge::ODOMETRY;
-        edge_req->dx      = kf_dx;
-        edge_req->dy      = kf_dy;
-        edge_req->dtheta  = kf_dth;
+        edge_req->from_id  = last_node_id_;
+        edge_req->to_id    = new_id;
+        edge_req->type     = Edge::ODOMETRY;
+        edge_req->dx       = kf_dx;
+        edge_req->dy       = kf_dy;
+        edge_req->dtheta   = kf_dth;
         for (int r = 0; r < 3; ++r)
             for (int c2 = 0; c2 < 3; ++c2)
                 edge_req->information.push_back(information(r,c2));
 
-        auto edge_res = callSync<decltype(clt_add_edge_),
-                                 graph_slam::srv::AddEdge::Request>(clt_add_edge_, edge_req);
-
-        if (!edge_res || !edge_res->success) {
-            RCLCPP_ERROR(get_logger(), "[Pipeline] add_edge failed"); return;
+        auto edge_future = clt_add_edge_->async_send_request(edge_req);
+        auto edge_status = edge_future.wait_for(std::chrono::seconds(5));
+        if (edge_status != std::future_status::ready) {
+            RCLCPP_ERROR(this->get_logger(), "[Pipeline] add_edge failed"); return;
+        }
+        auto edge_res = edge_future.get();
+        if (!edge_res->success) {
+            RCLCPP_ERROR(this->get_logger(), "[Pipeline] add_edge failed"); return;
         }
 
         last_node_id_ = new_id;
         last_x_ = current_x_; last_y_ = current_y_; last_theta_ = current_theta_;
         last_scan_ = current_scan_;
-        RCLCPP_INFO(get_logger(),
-            "[Pipeline] Node %d<-%d odom(%.2f,%.2f,%.1fdeg) icp=%d",
-            new_id, edge_req->from_id, odom_dx, odom_dy, odom_dth*180/M_PI, icp_ok);
+        RCLCPP_INFO(this->get_logger(), "[Pipeline] Node %d<-%d odom(%.2f,%.2f,%.1fdeg) icp=%d",
+                 new_id, edge_req->from_id, odom_dx, odom_dy, odom_dth*180/M_PI, icp_ok);
     }
 };
 
-} // namespace graph_slam
+}
 
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<graph_slam::Pipeline>());
+    auto node = std::make_shared<graph_slam::Pipeline>();
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }
