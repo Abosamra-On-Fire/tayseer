@@ -65,4 +65,4 @@ inline double wrapAngle(double angle) {
     return angle;
 }
 
-}  // namespace graph_slam
+}  

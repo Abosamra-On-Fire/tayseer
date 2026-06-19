@@ -22,19 +22,26 @@ SCMatrix buildScanContext(sensor_msgs::msg::LaserScan scan, double max_range)
     double ring_width   = max_range / NR;
     double sector_width = 2.0 * M_PI / NS;
     double angle = scan.angle_min;
-    for (size_t i = 0; i < scan.ranges.size(); ++i, angle += scan.angle_increment)
+    for (int i = 0; i < scan.ranges.size(); ++i )
     {
         double r = scan.ranges[i];
-        if (!std::isfinite(r) || r <= scan.range_min || r >= scan.range_max || r > max_range)
-            continue;
-        int ring = std::min(static_cast<int>(r / ring_width), NR - 1);
-        double a = fmod(angle, 2.0 * M_PI);
-        if (a < 0.0) a += 2.0 * M_PI;
-        int sec = std::min(static_cast<int>(a / sector_width), NS - 1);
-        if (r > sc(ring, sec)) sc(ring, sec) = r;
+        if (!   isfinite(r) || r <= scan.range_min || r >= scan.range_max || r > max_range)
+           {
+             angle += scan.angle_increment;
+             continue;
+           }
+        int ring =    min(static_cast<int>(r / ring_width), NR - 1);
+        double a = wrapAngle(angle);
+        int sec =    min(static_cast<int>(a / sector_width), NS - 1);
+        if (r > sc(ring, sec)) 
+        {
+            sc(ring, sec) = r;
+        }
+        angle += scan.angle_increment;
     }
     return sc;
 }
+
 pair<double, int> scanContextDistance(SCMatrix A, SCMatrix B)
 {
     SCMatrix A_hat = SCMatrix::Zero();
@@ -43,10 +50,16 @@ pair<double, int> scanContextDistance(SCMatrix A, SCMatrix B)
     {
         double na = A.col(j).norm();
         double nb = B.col(j).norm();
-        if (na > 1e-9) A_hat.col(j) = A.col(j) / na;
-        if (nb > 1e-9) B_hat.col(j) = B.col(j) / nb;
+        if (na > 1e-9) 
+        {
+            A_hat.col(j) = A.col(j) / na;
+        }
+        if (nb > 1e-9) 
+        {
+            B_hat.col(j) = B.col(j) / nb;
+        }
     }
-    double best_dist  = 2.0;
+    double best_dist  = numeric_limits<double>::max();
     int    best_shift = 0;
     for (int phi = 0; phi < NS; ++phi)
     {
@@ -57,7 +70,11 @@ pair<double, int> scanContextDistance(SCMatrix A, SCMatrix B)
             cosine_sum += A_hat.col(j).dot(B_hat.col(j_shifted));
         }
         double dist = 1.0 - cosine_sum / static_cast<double>(NS);
-        if (dist < best_dist) { best_dist = dist; best_shift = phi; }
+        if (dist < best_dist) 
+        {
+            best_dist = dist;
+            best_shift = phi;
+        }
     }
     return { best_dist, best_shift };
 }
@@ -67,7 +84,7 @@ public:
     LoopClosure() : Node("loop_closure")
     {
         max_range_           = declare_parameter("max_range",             20.0);
-        min_node_separation_ = declare_parameter("min_node_separation",   15);
+        min_node_separation_ = declare_parameter("min_node_separation",   5);
         num_candidates_      = declare_parameter("num_candidates",        10);
         sc_threshold_        = declare_parameter("sc_threshold",          0.35);
         icp_threshold_       = declare_parameter("icp_threshold",         0.05);
@@ -89,8 +106,8 @@ public:
         clt_icp_->wait_for_service();
 
         timer_ = create_wall_timer(
-            std::chrono::duration<double>(period_sec_),
-            std::bind(&LoopClosure::tick, this),
+               chrono::duration<double>(period_sec_),
+               bind(&LoopClosure::tick, this),
             cb_group_reentrant_);
 
         RCLCPP_INFO(get_logger(),
@@ -123,7 +140,7 @@ private:
 
     vector<SCMatrix>                     sc_cache_;
     vector<Eigen::Matrix<double, NR, 1>> rk_cache_;
-    map<pair<int,int>, rclcpp::Time>     added_lc_pairs_;
+    map<pair<int,int>>     added_lc_pairs_;
 
     static Eigen::Matrix<double, NR, 1> ringKey(SCMatrix& sc)
     {
@@ -132,7 +149,12 @@ private:
         {
             int nonzero = 0;
             for (int j = 0; j < NS; ++j)
-                if (sc(i, j) > 1e-9) ++nonzero;
+               {
+                 if (sc(i, j) > 1e-9) 
+                 {
+                     ++nonzero;
+                 }
+               }
             k(i) = static_cast<double>(nonzero) / NS;
         }
         return k;
@@ -140,8 +162,7 @@ private:
 
     void updateCaches(vector<PoseNode>& nodes)
     {
-        for (int i = static_cast<int>(sc_cache_.size());
-                 i < static_cast<int>(nodes.size()); ++i)
+        for (int i = sc_cache_.size();i < nodes.size(); ++i)
         {
             sc_cache_.push_back(buildScanContext(nodes[i].scan, max_range_));
             rk_cache_.push_back(ringKey(sc_cache_.back()));
@@ -163,7 +184,8 @@ private:
                          [](Hit& a, Hit& b) { return a.dist < b.dist; });
         vector<int> topk;
         topk.reserve(K);
-        for (int i = 0; i < K; ++i) topk.push_back(hits[i].ref);
+        for (int i = 0; i < K; ++i)
+             topk.push_back(hits[i].ref);
         return topk;
     }
 
@@ -172,37 +194,57 @@ private:
         vector<int> candidates = ringKeyTopK(q, num_refs);
         double best_sc    = numeric_limits<double>::max();
         int    best_ref   = -1;
-        for (int ref : candidates)
+        int   best_shift = 0;
+        for (int i=0; i < candidates.size(); ++i)
         {
-            auto [sc_dist, shift] = scanContextDistance(sc_cache_[q], sc_cache_[ref]);
-            if (sc_dist < best_sc) { best_sc = sc_dist; best_ref = ref; }
+            auto [sc_dist, shift] = scanContextDistance(sc_cache_[q], sc_cache_[candidates[i]]);
+            if (sc_dist < best_sc) 
+            { best_sc = sc_dist;
+              best_ref = candidates[i]; 
+              best_shift = shift;
+            }
         }
-        if (best_ref < 0 || best_sc >= sc_threshold_) return false;
+        if (best_ref < 0 || best_sc >= sc_threshold_) 
+        {
+            return false;
+        }
 
-        auto lc_pair = make_pair(nodes[best_ref].id, nodes[q].id);
+        pair<int, int> lc_pair(nodes[best_ref].id, nodes[q].id);
         auto it = added_lc_pairs_.find(lc_pair);
         if (it != added_lc_pairs_.end()) {
-            if ((this->get_clock()->now() - it->second).seconds() < 60.0) return false;
+                return false; 
         }
 
         double wdx = nodes[q].x - nodes[best_ref].x;
         double wdy = nodes[q].y - nodes[best_ref].y;
         double cr  = cos(nodes[best_ref].theta);
         double sr  = sin(nodes[best_ref].theta);
+        double sector_width   = 2.0 * M_PI / NS;
+        double shift_angle    = best_shift * sector_width;
+        double raw_dtheta     = wrapAngle(nodes[q].theta - nodes[best_ref].theta);
+        double init_dtheta    = wrapAngle(raw_dtheta - shift_angle);
 
-        auto sm_req = std::make_shared<graph_slam::srv::ScanMatch::Request>();
+        auto sm_req =    make_shared<graph_slam::srv::ScanMatch::Request>();
         sm_req->reference_scan = nodes[best_ref].scan;
         sm_req->current_scan   = nodes[q].scan;
         sm_req->init_dx        =  cr * wdx + sr * wdy;
         sm_req->init_dy        = -sr * wdx + cr * wdy;
-        sm_req->init_dtheta    = wrapAngle(nodes[q].theta - nodes[best_ref].theta);
+        sm_req->init_dtheta    = init_dtheta;
 
         auto sm_future = clt_icp_->async_send_request(sm_req);
-        auto sm_status = sm_future.wait_for(std::chrono::seconds(5));
-        if (sm_status != std::future_status::ready) return false;
+        if (sm_future.wait_for(chrono::seconds(5)) !=    future_status::ready) 
+       {
+         return false;
+       }
         auto sm_res = sm_future.get();
-        if (!sm_res->success) return false;
-        if (sm_res->score > icp_threshold_) return false;
+        if (!sm_res->success) 
+        {
+            return false;
+        }
+        if (sm_res->score > icp_threshold_) 
+        {
+            return false;
+        }
 
         double icp_trans = sqrt(sm_res->dx * sm_res->dx + sm_res->dy * sm_res->dy);
         if (icp_trans > max_icp_translation_)
@@ -212,7 +254,7 @@ private:
             return false;
         }
 
-        auto ae_req = std::make_shared<graph_slam::srv::AddEdge::Request>();
+        auto ae_req =    make_shared<graph_slam::srv::AddEdge::Request>();
         ae_req->from_id = nodes[best_ref].id;
         ae_req->to_id   = nodes[q].id;
         ae_req->type    = Edge::LOOP_CLOSURE;
@@ -224,8 +266,7 @@ private:
                 ae_req->information.push_back(sm_res->information[r * 3 + c]);
 
         auto ae_future = clt_edge_->async_send_request(ae_req);
-        auto ae_status = ae_future.wait_for(std::chrono::seconds(5));
-        if (ae_status != std::future_status::ready) return false;
+        if ( ae_future.wait_for(   chrono::seconds(5)) !=    future_status::ready) return false;
         auto ae_res = ae_future.get();
         if (ae_res->success)
         {
@@ -240,14 +281,19 @@ private:
 
     void tick()
     {
-        auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
+        auto req =    make_shared<graph_slam::srv::GetGraph::Request>();
         auto future = clt_graph_->async_send_request(req);
-        auto status = future.wait_for(std::chrono::seconds(5));
-        if (status != std::future_status::ready) return;
+        if (future.wait_for(   chrono::seconds(5)) !=    future_status::ready) 
+        {
+            return;
+        }
         auto srv_response = future.get();
 
         int N = static_cast<int>(srv_response->ids.size());
-        if (N < min_node_separation_ + 2) return;
+        if (N < min_node_separation_ + 2)
+        {
+            return;
+        }
 
         vector<PoseNode> nodes(N);
         for (int i = 0; i < N; ++i)
@@ -281,7 +327,7 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<graph_slam::LoopClosure>();
+    auto node =    make_shared<graph_slam::LoopClosure>();
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
     executor.spin();

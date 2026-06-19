@@ -24,23 +24,25 @@ namespace graph_slam {
         GraphManager()
         : Node("graph_manager")
         {
-            // declare_parameter<bool>("use_sim_time", true);
             node_scale_ = this->declare_parameter("node_scale", 0.05);
             edge_width_ = this->declare_parameter("edge_width", 0.02);
 
             cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
             add_node_srv_ = this->create_service<graph_slam::srv::AddNode>("/graph_slam/add_node",
-                std::bind(&GraphManager::addNodeCallback, this, std::placeholders::_1, std::placeholders::_2),
+                 bind(&GraphManager::addNodeCallback, this,  placeholders::_1,  placeholders::_2),
                 rmw_qos_profile_services_default, cb_group_);
+
             add_edge_srv_ = this->create_service<graph_slam::srv::AddEdge>("/graph_slam/add_edge",
-                std::bind(&GraphManager::addEdgeCallback, this, std::placeholders::_1, std::placeholders::_2),
+                 bind(&GraphManager::addEdgeCallback, this,  placeholders::_1,  placeholders::_2),
                 rmw_qos_profile_services_default, cb_group_);
+
             get_graph_srv_ = this->create_service<graph_slam::srv::GetGraph>("/graph_slam/get_graph",
-                std::bind(&GraphManager::getGraphCallback, this, std::placeholders::_1, std::placeholders::_2),
+                 bind(&GraphManager::getGraphCallback, this,  placeholders::_1,  placeholders::_2),
                 rmw_qos_profile_services_default, cb_group_);
+
             update_poses_srv_ = this->create_service<graph_slam::srv::UpdatePoses>("/graph_slam/update_poses",
-                std::bind(&GraphManager::updatePosesCallback, this, std::placeholders::_1, std::placeholders::_2),
+                 bind(&GraphManager::updatePosesCallback, this,  placeholders::_1,  placeholders::_2),
                 rmw_qos_profile_services_default, cb_group_);
 
             rclcpp::QoS latched_qos(1);
@@ -48,16 +50,14 @@ namespace graph_slam {
 
             publish_markers        = this->create_publisher<visualization_msgs::msg::MarkerArray>("graph_markers",    latched_qos);
             publish_raw_path       = this->create_publisher<nav_msgs::msg::Path>("raw_path",       latched_qos);
-            publish_optimized_path = this->create_publisher<nav_msgs::msg::Path>("optimized_path", latched_qos);
 
             RCLCPP_INFO(this->get_logger(), "GraphManager initialized with node_scale: %f, edge_width: %f", node_scale_, edge_width_);
         }
 
     private:
-
-        vector<PoseNode> nodes_;
         vector<Edge>     edges_;
-        std::mutex       mutex_;
+        vector<PoseNode> nodes_;
+        mutex       mutex_;
 
         rclcpp::CallbackGroup::SharedPtr cb_group_;
 
@@ -65,87 +65,88 @@ namespace graph_slam {
         rclcpp::Service<graph_slam::srv::AddEdge>::SharedPtr      add_edge_srv_;
         rclcpp::Service<graph_slam::srv::GetGraph>::SharedPtr     get_graph_srv_;
         rclcpp::Service<graph_slam::srv::UpdatePoses>::SharedPtr  update_poses_srv_;
+
         rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr publish_markers;
         rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr publish_raw_path;
-        rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr publish_optimized_path;
+
         double node_scale_;
         double edge_width_;
 
-        void addNodeCallback(const std::shared_ptr<graph_slam::srv::AddNode::Request> req, std::shared_ptr<graph_slam::srv::AddNode::Response> res)
+        void addNodeCallback(const shared_ptr<graph_slam::srv::AddNode::Request> req, shared_ptr<graph_slam::srv::AddNode::Response> res)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            PoseNode new_node;
-            new_node.id        = nodes_.size();
-            new_node.x         = req->x;
-            new_node.y         = req->y;
-            new_node.theta     = req->theta;
-            new_node.scan      = req->scan;
-            new_node.timestamp = req->timestamp;
+            lock_guard< mutex> lock(mutex_);
+            PoseNode n;
+            n.id        = nodes_.size();
+            n.x         = req->x;
+            n.y         = req->y;
+            n.theta     = req->theta;
+            n.scan      = req->scan;
+            n.timestamp = req->timestamp;
 
-            nodes_.push_back(new_node);
-            res->id      = new_node.id;
+            nodes_.push_back(n);
+            res->id      = n.id;
             res->success = true;
             publishAll();
         }
 
-        void addEdgeCallback(const std::shared_ptr<graph_slam::srv::AddEdge::Request> req, std::shared_ptr<graph_slam::srv::AddEdge::Response> res)
+        void addEdgeCallback(const  shared_ptr<graph_slam::srv::AddEdge::Request> req,  shared_ptr<graph_slam::srv::AddEdge::Response> res)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+             lock_guard< mutex> lock(mutex_);
             if (req->from_id >= nodes_.size() || req->to_id >= nodes_.size()) {
                 res->success = false;
                 return;
             }
 
-            Edge new_edge;
-            new_edge.from_id  = req->from_id;
-            new_edge.to_id    = req->to_id;
-            new_edge.type     = static_cast<Edge::Type>(req->type);
-            new_edge.dx       = req->dx;
-            new_edge.dy       = req->dy;
-            new_edge.dtheta   = req->dtheta;
+            Edge e;
+            e.from_id  = req->from_id;
+            e.to_id    = req->to_id;
+            e.type     = static_cast<Edge::Type>(req->type);
+            e.dx       = req->dx;
+            e.dy       = req->dy;
+            e.dtheta   = req->dtheta;
             for (int i = 0; i < 3; ++i)
                 for (int j = 0; j < 3; ++j)
-                    new_edge.information(i, j) = req->information[i * 3 + j];
+                    e.information(i, j) = req->information[i * 3 + j];
 
-            edges_.push_back(new_edge);
+            edges_.push_back(e);
             res->success = true;
             publishAll();
         }
 
-        void getGraphCallback(const std::shared_ptr<graph_slam::srv::GetGraph::Request> req, std::shared_ptr<graph_slam::srv::GetGraph::Response> res)
+        void getGraphCallback(const  shared_ptr<graph_slam::srv::GetGraph::Request> req,  shared_ptr<graph_slam::srv::GetGraph::Response> res)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (auto& node : nodes_) {
-                res->ids.push_back(node.id);
-                res->xs.push_back(node.x);
-                res->ys.push_back(node.y);
-                res->thetas.push_back(node.theta);
-                res->timestamps.push_back(node.timestamp);
-                res->scans.push_back(node.scan);
+             lock_guard< mutex> lock(mutex_);
+            for (int i = 0; i < nodes_.size(); ++i) {
+                res->ids.push_back(nodes_[i].id);
+                res->xs.push_back(nodes_[i].x);
+                res->ys.push_back(nodes_[i].y);
+                res->thetas.push_back(nodes_[i].theta);
+                res->timestamps.push_back(nodes_[i].timestamp);
+                res->scans.push_back(nodes_[i].scan);
             }
 
-            for (auto& edge : edges_) {
-                res->edges_from_id.push_back(edge.from_id);
-                res->edges_to_id.push_back(edge.to_id);
-                res->edges_type.push_back(edge.type);
-                res->edges_dx.push_back(edge.dx);
-                res->edges_dy.push_back(edge.dy);
-                res->edges_dtheta.push_back(edge.dtheta);
+            for (int i = 0; i < edges_.size(); ++i) {
+                res->edges_from_id.push_back(edges_[i].from_id);
+                res->edges_to_id.push_back(edges_[i].to_id);
+                res->edges_type.push_back(edges_[i].type);
+                res->edges_dx.push_back(edges_[i].dx);
+                res->edges_dy.push_back(edges_[i].dy);
+                res->edges_dtheta.push_back(edges_[i].dtheta);
                 for (int i = 0; i < 3; ++i)
                     for (int j = 0; j < 3; ++j)
-                        res->edges_information.push_back(edge.information(i, j));
+                        res->edges_information.push_back(edges_[i].information(i, j));
             }
         }
 
-        void updatePosesCallback(const std::shared_ptr<graph_slam::srv::UpdatePoses::Request> req, std::shared_ptr<graph_slam::srv::UpdatePoses::Response> res)
+        void updatePosesCallback(const  shared_ptr<graph_slam::srv::UpdatePoses::Request> req,  shared_ptr<graph_slam::srv::UpdatePoses::Response> res)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+             lock_guard< mutex> lock(mutex_);
             if (req->ids.size() != req->xs.size() || req->ids.size() != req->ys.size() || req->ids.size() != req->thetas.size()) {
                 res->success = false;
                 return;
             }
 
-            for (size_t i = 0; i < req->ids.size(); ++i) {
+            for (int i = 0; i < req->ids.size(); ++i) {
                 int id = req->ids[i];
                 if (id >= (int)nodes_.size()) {
                     res->success = false;
@@ -173,16 +174,16 @@ namespace graph_slam {
             delete_marker.action = visualization_msgs::msg::Marker::DELETEALL;
             marker_array.markers.push_back(delete_marker);
 
-            for (auto& node : nodes_) {
+            for (int i = 0; i < nodes_.size(); ++i) {
                 visualization_msgs::msg::Marker marker;
                 marker.header.frame_id = "map";
                 marker.header.stamp    = now;
                 marker.ns              = "nodes";
-                marker.id              = node.id;
+                marker.id              = nodes_[i].id;
                 marker.type            = visualization_msgs::msg::Marker::SPHERE;
                 marker.action          = visualization_msgs::msg::Marker::ADD;
-                marker.pose.position.x = node.x;
-                marker.pose.position.y = node.y;
+                marker.pose.position.x = nodes_[i].x;
+                marker.pose.position.y = nodes_[i].y;
                 marker.pose.position.z = 0.0;
                 marker.pose.orientation.w = 1.0;
                 marker.scale.x = node_scale_;
@@ -197,7 +198,7 @@ namespace graph_slam {
                 text_marker.header.frame_id = "map";
                 text_marker.header.stamp    = now;
                 text_marker.ns              = "node_ids";
-                text_marker.id              = node.id;
+                text_marker.id              = nodes_[i].id;
                 text_marker.type            = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
                 text_marker.action          = visualization_msgs::msg::Marker::ADD;
                 text_marker.pose            = marker.pose;
@@ -207,30 +208,30 @@ namespace graph_slam {
                 text_marker.color.r = 1.0;
                 text_marker.color.g = 1.0;
                 text_marker.color.b = 1.0;
-                text_marker.text    = to_string(node.id);
+                text_marker.text    = to_string(nodes_[i].id);
 
                 marker_array.markers.push_back(marker);
                 marker_array.markers.push_back(text_marker);
             }
 
             int edge_id = 0;
-            for (const auto& edge : edges_) {
-                if (edge.from_id >= (int)nodes_.size() || edge.to_id >= (int)nodes_.size()) continue;
+            for (int i = 0; i < edges_.size(); ++i) {
+                if (edges_[i].from_id >= (int)nodes_.size() || edges_[i].to_id >= (int)nodes_.size()) continue;
 
-                auto& from_node = nodes_[edge.from_id];
-                auto& to_node   = nodes_[edge.to_id];
+                auto& from_node = nodes_[edges_[i].from_id];
+                auto& to_node   = nodes_[edges_[i].to_id];
 
                 visualization_msgs::msg::Marker marker;
                 marker.header.frame_id = "map";
                 marker.header.stamp    = now;
-                marker.ns    = (edge.type == Edge::ODOMETRY) ? "odometry_edges" : "loop_closure_edges";
+                marker.ns    = (edges_[i].type == Edge::ODOMETRY) ? "odometry_edges" : "loop_closure_edges";
                 marker.id    = edge_id++;
                 marker.type  = visualization_msgs::msg::Marker::LINE_LIST;
                 marker.action= visualization_msgs::msg::Marker::ADD;
                 marker.pose.orientation.w = 1.0;
                 marker.color.a = 1.0;
 
-                if (edge.type == Edge::ODOMETRY) {
+                if (edges_[i].type == Edge::ODOMETRY) {
                     marker.scale.x = edge_width_;
                     marker.color.r = 0.0;
                     marker.color.g = 0.0;
@@ -257,18 +258,17 @@ namespace graph_slam {
             nav_msgs::msg::Path path;
             path.header.frame_id = "map";
             path.header.stamp    = this->get_clock()->now();
-            for (const auto& node : nodes_) {
+            for (int i = 0; i < nodes_.size(); ++i) {
                 geometry_msgs::msg::PoseStamped pose;
                 pose.header            = path.header;
-                pose.pose.position.x   = node.x;
-                pose.pose.position.y   = node.y;
+                pose.pose.position.x   = nodes_[i].x;
+                pose.pose.position.y   = nodes_[i].y;
                 pose.pose.position.z   = 0.0;
-                pose.pose.orientation.z = sin(node.theta / 2.0);
-                pose.pose.orientation.w = cos(node.theta / 2.0);
+                pose.pose.orientation.z = sin(nodes_[i].theta / 2.0);
+                pose.pose.orientation.w = cos(nodes_[i].theta / 2.0);//quaternion 
                 path.poses.push_back(pose);
             }
             publish_raw_path->publish(path);
-            publish_optimized_path->publish(path);
         }
 
     };
@@ -276,7 +276,7 @@ namespace graph_slam {
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    auto manager = std::make_shared<graph_slam::GraphManager>();
+    auto manager =  make_shared<graph_slam::GraphManager>();
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(manager);
     executor.spin();

@@ -25,10 +25,10 @@ using LinearSolver = g2o::LinearSolverEigen<BlockSolver::PoseMatrixType>;
 
 static g2o::SparseOptimizer* makeOptimizer()
 {
-    auto lin = std::make_unique<LinearSolver>();
+    auto lin =  make_unique<LinearSolver>();
     lin->setBlockOrdering(false);
-    auto blk = std::make_unique<BlockSolver>(std::move(lin));
-    auto* alg = new g2o::OptimizationAlgorithmLevenberg(std::move(blk));
+    auto blk =  make_unique<BlockSolver>( move(lin));
+    auto* alg = new g2o::OptimizationAlgorithmLevenberg( move(blk));
     auto* opt = new g2o::SparseOptimizer();
     opt->setAlgorithm(alg);
     opt->setVerbose(false);
@@ -45,7 +45,7 @@ public:
         check_period_sec_     = this->declare_parameter("check_period_sec",     2.0);
         huber_delta_          = this->declare_parameter("huber_delta",          0.3);
         phase1_iterations_    = this->declare_parameter("phase1_iterations",    30);
-        lc_chi2_threshold_    = this->declare_parameter("lc_chi2_threshold",    15.0);
+        lc_chi2_threshold_    = this->declare_parameter("lc_chi2_threshold",    7.81); // 95% confidence for 3 DOF
         do_outlier_rejection_ = this->declare_parameter("do_outlier_rejection", true);
         min_lc_to_optimize_   = this->declare_parameter("min_lc_to_optimize",   2);
 
@@ -59,15 +59,15 @@ public:
         clt_get_graph_->wait_for_service();
         clt_update_poses_->wait_for_service();
         last_node_count_ = 0;
-        last_lc_count_   = 0;
+        last_loop_closure_count_ = 0;
 
         RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] every=%d iters=%d+%d huber=%.2f chi2_thr=%.2f min_lc=%d",
                  optimize_every_n_, phase1_iterations_, maximum_iterations_,
                  huber_delta_, lc_chi2_threshold_, min_lc_to_optimize_);
 
         timer_ = this->create_wall_timer(
-            std::chrono::duration<double>(check_period_sec_),
-            std::bind(&GraphOptimizer::timerCallback, this),
+             chrono::duration<double>(check_period_sec_),
+             bind(&GraphOptimizer::timerCallback, this),
             cb_group_reentrant_);
     }
 
@@ -82,17 +82,16 @@ private:
     rclcpp::CallbackGroup::SharedPtr cb_group_update_poses_;
 
     int    optimize_every_n_, maximum_iterations_, phase1_iterations_;
-    int    last_node_count_, last_lc_count_;
+    int    last_node_count_, last_loop_closure_count_;
     int    min_lc_to_optimize_;
     double check_period_sec_, huber_delta_, lc_chi2_threshold_;
     bool   do_outlier_rejection_;
 
-    void addVertices(g2o::SparseOptimizer* opt,
-                     const graph_slam::srv::GetGraph::Response& resp)
+    void addVertices(g2o::SparseOptimizer* opt, graph_slam::srv::GetGraph::Response& resp)
     {
-        int N = resp.ids.size();
-        for (int i = 0; i < N; ++i) {
-            auto* v = new g2o::VertexSE2();
+        
+        for (int i = 0; i < resp.ids.size(); ++i) {
+            g2o::VertexSE2* v = new g2o::VertexSE2();
             v->setId(resp.ids[i]);
             v->setEstimate(g2o::SE2(resp.xs[i], resp.ys[i], resp.thetas[i]));
             if (i == 0) v->setFixed(true);
@@ -100,7 +99,7 @@ private:
         }
     }
 
-    Eigen::Matrix3d buildInfo(const graph_slam::srv::GetGraph::Response& resp, int ei)
+    Eigen::Matrix3d buildInfo(graph_slam::srv::GetGraph::Response& resp, int ei)
     {
         double MAX_XY = 400.0, MAX_YAW = 800.0;
         Eigen::Matrix3d info = Eigen::Matrix3d::Zero();
@@ -114,52 +113,50 @@ private:
         return info;
     }
 
-    tuple<int,int,int> addEdges(
-        g2o::SparseOptimizer* opt,
-        const graph_slam::srv::GetGraph::Response& resp,
-        bool include_lc,
-        bool use_robust,
-        vector<pair<g2o::EdgeSE2*, int>>* lc_edge_map = nullptr)
+    tuple<int,int,int> addEdges(g2o::SparseOptimizer* opt,graph_slam::srv::GetGraph::Response& resp,bool include_lc,vector<pair<g2o::EdgeSE2*, int>>* lc_edge_map = nullptr)
     {
-        int odom_ok = 0, lc_ok = 0, skipped = 0;
-        int N_edges = resp.edges_from_id.size();
-        for (int i = 0; i < N_edges; ++i) {
+        int odometry_count = 0, loop_closure_count = 0, skipped_count = 0;
+        for (int i = 0; i < resp.edges_from_id.size(); ++i) {
             bool is_lc = (resp.edges_type[i] == static_cast<int>(Edge::LOOP_CLOSURE));
-            if (is_lc && !include_lc) continue;
+            if (is_lc && !include_lc) 
+                continue;
 
-            auto* e = new g2o::EdgeSE2();
+            g2o::EdgeSE2* e = new g2o::EdgeSE2();
             e->vertices()[0] = opt->vertex(resp.edges_from_id[i]);
             e->vertices()[1] = opt->vertex(resp.edges_to_id[i]);
-            if (!e->vertices()[0] || !e->vertices()[1]) { delete e; ++skipped; continue; }
+            if (!e->vertices()[0] || !e->vertices()[1]) 
+                { delete e; 
+                  ++skipped_count; 
+                  continue; 
+                }
 
-            e->setMeasurement(g2o::SE2(resp.edges_dx[i], resp.edges_dy[i],
-                                       resp.edges_dtheta[i]));
+            e->setMeasurement(g2o::SE2(resp.edges_dx[i], resp.edges_dy[i],resp.edges_dtheta[i]));
             e->setInformation(buildInfo(resp, i));
 
-            if (is_lc && use_robust) {
+            if (is_lc ) {
                 auto* k = new g2o::RobustKernelHuber();
                 k->setDelta(huber_delta_);
                 e->setRobustKernel(k);
-            }
+                ++loop_closure_count;
+                if (lc_edge_map) 
+                    lc_edge_map->push_back({e, i});
+            } 
+            else 
+                ++odometry_count;
             opt->addEdge(e);
-
-            if (is_lc) {
-                ++lc_ok;
-                if (lc_edge_map) lc_edge_map->push_back({e, i});
-            } else ++odom_ok;
         }
-        return {odom_ok, lc_ok, skipped};
+        return {odometry_count, loop_closure_count, skipped_count};
     }
 
-    void publishPoses(g2o::SparseOptimizer* opt,
-                      const graph_slam::srv::GetGraph::Response& resp,
-                      int N_nodes, int N_nodes_val, int lc_count)
+    void publishPoses(g2o::SparseOptimizer* opt,graph_slam::srv::GetGraph::Response& resp,int N_nodes, int N_nodes_val, int loop_closure_count)
     {
-        auto update_req = std::make_shared<graph_slam::srv::UpdatePoses::Request>();
+        auto update_req = make_shared<graph_slam::srv::UpdatePoses::Request>();
         for (int i = 0; i < N_nodes; ++i) {
             auto* v = dynamic_cast<g2o::VertexSE2*>(opt->vertex(resp.ids[i]));
-            if (!v) continue;
+            if (!v) 
+                continue;
             g2o::SE2 est = v->estimate();
+
             update_req->ids.push_back(resp.ids[i]);
             update_req->xs.push_back(est.translation().x());
             update_req->ys.push_back(est.translation().y());
@@ -167,14 +164,15 @@ private:
         }
 
         auto future = clt_update_poses_->async_send_request(update_req);
-        auto status = future.wait_for(std::chrono::seconds(5));
-        if (status == std::future_status::ready) {
+        if (future.wait_for( chrono::seconds(5)) ==  future_status::ready) {
             auto result = future.get();
             if (result->success) {
                 last_node_count_ = N_nodes_val;
-                last_lc_count_   = lc_count;
+                last_loop_closure_count_ = loop_closure_count;
                 RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] Poses updated, triggering remap");
-                std_msgs::msg::Bool msg; msg.data = true; pub_trigger_remap_->publish(msg);
+                std_msgs::msg::Bool msg; 
+                msg.data = true; 
+                pub_trigger_remap_->publish(msg);
             } else {
                 RCLCPP_ERROR(this->get_logger(), "[GraphOptimizer] Failed to update poses");
             }
@@ -185,48 +183,51 @@ private:
 
     void timerCallback()
     {
-        auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
+        auto req =  make_shared<graph_slam::srv::GetGraph::Request>();
         auto future = clt_get_graph_->async_send_request(req);
-        auto status = future.wait_for(std::chrono::seconds(5));
-        if (status != std::future_status::ready) return;
-        auto resp_ptr = future.get();
-        graph_slam::srv::GetGraph::Response srv_response = *resp_ptr;
+        if (future.wait_for( chrono::seconds(5)) !=  future_status::ready) 
+            return;
+
+        graph_slam::srv::GetGraph::Response srv_response = *future.get();
 
         int N_nodes = srv_response.ids.size();
         int N_edges = srv_response.edges_from_id.size();
-        if (N_nodes < 2) return;
+        if (N_nodes < 2) 
+            return;
 
-        int lc_count = 0;
+        int loop_closure_count = 0;
         for (int i = 0; i < N_edges; ++i)
             if (srv_response.edges_type[i] == static_cast<int>(Edge::LOOP_CLOSURE))
-                ++lc_count;
+                ++loop_closure_count;
 
-        bool new_lc       = (lc_count > last_lc_count_);
+        bool new_lc       = (loop_closure_count > last_loop_closure_count_);
         bool enough_nodes = (N_nodes >= last_node_count_ + optimize_every_n_);
 
-        if (!new_lc && !enough_nodes) return;
+        if (!new_lc && !enough_nodes) 
+            return;
 
-        if (new_lc && lc_count < min_lc_to_optimize_) {
-            RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] Only %d LC, waiting for %d before optimizing with LC",
-                     lc_count, min_lc_to_optimize_);
-            if (!enough_nodes) return;
+        if (new_lc && loop_closure_count < min_lc_to_optimize_) {
+            RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] Only %d LC, waiting for %d before optimizing with LC",loop_closure_count, min_lc_to_optimize_);
+            if (!enough_nodes) 
+                return;
         }
 
-        bool use_lc = (lc_count >= min_lc_to_optimize_);
+        bool use_lc = (loop_closure_count >= min_lc_to_optimize_);
 
         RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] %d nodes %d edges %d LC  use_lc=%d",
-                 N_nodes, N_edges, lc_count, use_lc);
+                 N_nodes, N_edges, loop_closure_count, use_lc);
 
         if (use_lc) {
-            std::unique_ptr<g2o::SparseOptimizer> opt1(makeOptimizer());
+             unique_ptr<g2o::SparseOptimizer> opt1(makeOptimizer());
             addVertices(opt1.get(), srv_response);
-            auto [o1, l1, s1] = addEdges(opt1.get(), srv_response, false, false);
+            auto [o1, l1, s1] = addEdges(opt1.get(), srv_response, false);
             if (o1 > 0) {
                 opt1->initializeOptimization();
                 opt1->optimize(phase1_iterations_);
                 for (int i = 0; i < N_nodes; ++i) {
                     auto* v = dynamic_cast<g2o::VertexSE2*>(opt1->vertex(srv_response.ids[i]));
-                    if (!v) continue;
+                    if (!v) 
+                        continue;
                     srv_response.xs[i]     = v->estimate().translation().x();
                     srv_response.ys[i]     = v->estimate().translation().y();
                     srv_response.thetas[i] = v->estimate().rotation().angle();
@@ -236,9 +237,9 @@ private:
         }
 
         vector<pair<g2o::EdgeSE2*, int>> lc_edge_map;
-        std::unique_ptr<g2o::SparseOptimizer> opt2(makeOptimizer());
+         unique_ptr<g2o::SparseOptimizer> opt2(makeOptimizer());
         addVertices(opt2.get(), srv_response);
-        auto [o2, l2, s2] = addEdges(opt2.get(), srv_response, use_lc, true, &lc_edge_map);
+        auto [o2, l2, s2] = addEdges(opt2.get(), srv_response, use_lc, &lc_edge_map);
 
         RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] Phase2: %d odom %d LC %d skipped", o2, l2, s2);
         opt2->initializeOptimization();
@@ -253,35 +254,33 @@ private:
                 double chi2 = e_ptr->chi2();
                 if (chi2 > lc_chi2_threshold_) {
                     outlier_indices.push_back(orig_idx);
-                    RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] LC outlier edge %d<->%d chi2=%.2f > %.2f",
-                             srv_response.edges_from_id[orig_idx],
-                             srv_response.edges_to_id[orig_idx],
-                             chi2, lc_chi2_threshold_);
+                    RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] LC outlier edge %d<->%d chi2=%.2f > %.2f",srv_response.edges_from_id[orig_idx],srv_response.edges_to_id[orig_idx],chi2, lc_chi2_threshold_);
                 }
             }
 
             if (!outlier_indices.empty()) {
-                RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] Phase3: removing %d outlier LC edges",
-                         (int)outlier_indices.size());
+                RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] Phase3: removing %d outlier LC edges",(int)outlier_indices.size());
 
                 set<int> outlier_set(outlier_indices.begin(), outlier_indices.end());
 
                 for (int i = 0; i < N_nodes; ++i) {
                     auto* v = dynamic_cast<g2o::VertexSE2*>(opt2->vertex(srv_response.ids[i]));
-                    if (!v) continue;
+                    if (!v) 
+                        continue;
                     srv_response.xs[i]     = v->estimate().translation().x();
                     srv_response.ys[i]     = v->estimate().translation().y();
                     srv_response.thetas[i] = v->estimate().rotation().angle();
                 }
 
-                std::unique_ptr<g2o::SparseOptimizer> opt3(makeOptimizer());
+                 unique_ptr<g2o::SparseOptimizer> opt3(makeOptimizer());
                 addVertices(opt3.get(), srv_response);
 
                 int N_e = srv_response.edges_from_id.size();
                 int o3 = 0, l3 = 0;
                 for (int i = 0; i < N_e; ++i) {
                     bool is_lc = (srv_response.edges_type[i] == static_cast<int>(Edge::LOOP_CLOSURE));
-                    if (is_lc && outlier_set.count(i)) continue;
+                    if (is_lc && outlier_set.count(i)) 
+                        continue;
 
                     auto* e = new g2o::EdgeSE2();
                     e->vertices()[0] = opt3->vertex(srv_response.edges_from_id[i]);
@@ -305,12 +304,12 @@ private:
                 RCLCPP_INFO(this->get_logger(), "[GraphOptimizer] Phase3 done: %d iters chi2=%.3f (%d odom %d LC kept)",
                          iters3, opt3->chi2(), o3, l3);
 
-                publishPoses(opt3.get(), srv_response, N_nodes, N_nodes, lc_count);
+                publishPoses(opt3.get(), srv_response, N_nodes, N_nodes, loop_closure_count);
                 return;
             }
         }
 
-        publishPoses(opt2.get(), srv_response, N_nodes, N_nodes, lc_count);
+        publishPoses(opt2.get(), srv_response, N_nodes, N_nodes, loop_closure_count);
     }
 };
 
@@ -319,7 +318,7 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<graph_slam::GraphOptimizer>();
+    auto node =  make_shared<graph_slam::GraphOptimizer>();
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
     executor.spin();
