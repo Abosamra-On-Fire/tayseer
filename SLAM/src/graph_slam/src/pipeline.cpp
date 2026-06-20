@@ -159,7 +159,7 @@ private:
         {
             return;
         }
-        auto req =   make_shared<graph_slam::srv::AddNode::Request>();
+        auto req =   std::make_shared<graph_slam::srv::AddNode::Request>();
         req->x         = current_x_;
         req->y         = current_y_;
         req->theta     = current_theta_;
@@ -197,7 +197,7 @@ private:
             return;
         }
 
-        auto node_req =   make_shared<graph_slam::srv::AddNode::Request>();
+        auto node_req =   std::make_shared<graph_slam::srv::AddNode::Request>();
         node_req->x         = current_x_;
         node_req->y         = current_y_;
         node_req->theta     = current_theta_;
@@ -231,7 +231,7 @@ private:
         bool icp_ok = false;
 
         if (use_icp_odom_) {
-            auto sm_req =   make_shared<graph_slam::srv::ScanMatch::Request>();
+            auto sm_req =   std::make_shared<graph_slam::srv::ScanMatch::Request>();
             sm_req->reference_scan = last_scan_;
             sm_req->current_scan   = current_scan_;
             sm_req->init_dx        = kf_dx;
@@ -240,7 +240,7 @@ private:
 
             auto sm_future = clt_scan_match_->async_send_request(sm_req);
             auto sm_status = sm_future.wait_for(  chrono::seconds(5));
-              shared_ptr<graph_slam::srv::ScanMatch::Response> sm_res;
+              std::shared_ptr<graph_slam::srv::ScanMatch::Response> sm_res;
             if (sm_status ==   future_status::ready);
                 sm_res = sm_future.get();
 
@@ -279,7 +279,7 @@ private:
             information(2,2) = 1.0 / odom_cov_th_;
         }
 
-        auto edge_req =   make_shared<graph_slam::srv::AddEdge::Request>();
+        auto edge_req =   std::make_shared<graph_slam::srv::AddEdge::Request>();
         edge_req->from_id  = last_node_id_;
         edge_req->to_id    = new_id;
         edge_req->type     = Edge::ODOMETRY;

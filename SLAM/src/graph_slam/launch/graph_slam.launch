@@ -1,6 +1,6 @@
 """
 Run with:
-    ros2 launch graph_slam graph_slam.launch.py
+    ros2 launch graph_slam graph_slam.launch
 """
 
 from launch import LaunchDescription

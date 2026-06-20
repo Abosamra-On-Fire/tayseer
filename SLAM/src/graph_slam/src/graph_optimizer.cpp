@@ -150,7 +150,7 @@ private:
 
     void publishPoses(g2o::SparseOptimizer* opt,graph_slam::srv::GetGraph::Response& resp,int N_nodes, int N_nodes_val, int loop_closure_count)
     {
-        auto update_req = make_shared<graph_slam::srv::UpdatePoses::Request>();
+        auto update_req = std::make_shared<graph_slam::srv::UpdatePoses::Request>();
         for (int i = 0; i < N_nodes; ++i) {
             auto* v = dynamic_cast<g2o::VertexSE2*>(opt->vertex(resp.ids[i]));
             if (!v) 
@@ -183,7 +183,7 @@ private:
 
     void timerCallback()
     {
-        auto req =  make_shared<graph_slam::srv::GetGraph::Request>();
+        auto req =  std::make_shared<graph_slam::srv::GetGraph::Request>();
         auto future = clt_get_graph_->async_send_request(req);
         if (future.wait_for( chrono::seconds(5)) !=  future_status::ready) 
             return;
@@ -318,7 +318,7 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    auto node =  make_shared<graph_slam::GraphOptimizer>();
+    auto node =  std::make_shared<graph_slam::GraphOptimizer>();
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
     executor.spin();

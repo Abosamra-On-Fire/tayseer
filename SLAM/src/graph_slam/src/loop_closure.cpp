@@ -140,7 +140,7 @@ private:
 
     vector<SCMatrix>                     sc_cache_;
     vector<Eigen::Matrix<double, NR, 1>> rk_cache_;
-    map<pair<int,int>>     added_lc_pairs_;
+    set<pair<int,int>>     added_lc_pairs_;
 
     static Eigen::Matrix<double, NR, 1> ringKey(SCMatrix& sc)
     {
@@ -224,7 +224,7 @@ private:
         double raw_dtheta     = wrapAngle(nodes[q].theta - nodes[best_ref].theta);
         double init_dtheta    = wrapAngle(raw_dtheta - shift_angle);
 
-        auto sm_req =    make_shared<graph_slam::srv::ScanMatch::Request>();
+        auto sm_req =    std::make_shared<graph_slam::srv::ScanMatch::Request>();
         sm_req->reference_scan = nodes[best_ref].scan;
         sm_req->current_scan   = nodes[q].scan;
         sm_req->init_dx        =  cr * wdx + sr * wdy;
@@ -254,7 +254,7 @@ private:
             return false;
         }
 
-        auto ae_req =    make_shared<graph_slam::srv::AddEdge::Request>();
+        auto ae_req =    std::make_shared<graph_slam::srv::AddEdge::Request>();
         ae_req->from_id = nodes[best_ref].id;
         ae_req->to_id   = nodes[q].id;
         ae_req->type    = Edge::LOOP_CLOSURE;
@@ -270,7 +270,7 @@ private:
         auto ae_res = ae_future.get();
         if (ae_res->success)
         {
-            added_lc_pairs_[lc_pair] = this->get_clock()->now();
+            added_lc_pairs_.insert(lc_pair);
             RCLCPP_INFO(get_logger(), "[LC] ACCEPTED  %d <-> %d   sc=%.3f  icp=%.4f  trans=%.3fm",
                          nodes[best_ref].id, nodes[q].id,
                          best_sc, sm_res->score, icp_trans);
@@ -281,7 +281,7 @@ private:
 
     void tick()
     {
-        auto req =    make_shared<graph_slam::srv::GetGraph::Request>();
+        auto req =    std::make_shared<graph_slam::srv::GetGraph::Request>();
         auto future = clt_graph_->async_send_request(req);
         if (future.wait_for(   chrono::seconds(5)) !=    future_status::ready) 
         {
@@ -327,7 +327,7 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    auto node =    make_shared<graph_slam::LoopClosure>();
+    auto node =    std::make_shared<graph_slam::LoopClosure>();
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
     executor.spin();

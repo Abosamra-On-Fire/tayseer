@@ -276,7 +276,7 @@ namespace graph_slam {
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    auto manager =  make_shared<graph_slam::GraphManager>();
+    auto manager =  std::make_shared<graph_slam::GraphManager>();
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(manager);
     executor.spin();

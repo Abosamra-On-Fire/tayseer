@@ -18,7 +18,7 @@
   <exec_depend>rosidl_default_runtime</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
-  <!-- ── ROS 2 dependencies ────────────────────────────── -->
+  <!-- ── ROS 2 C++ dependencies ────────────────────────── -->
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
@@ -31,8 +31,13 @@
   <depend>pcl_ros</depend>
   <depend>pcl_conversions</depend>
 
+  <!-- ── Python / pose_printer dependencies ───────────── -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>python3-rclpy</exec_depend>
+
   <!-- ── System dependencies ───────────────────────────── -->
   <build_depend>libpcl-all-dev</build_depend>
   <build_depend>libeigen3-dev</build_depend>
+
   <!-- g2o is installed manually, not in rosdep -->
 </package>

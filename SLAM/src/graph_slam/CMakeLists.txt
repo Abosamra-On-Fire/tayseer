@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 project(graph_slam)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
 
@@ -53,7 +54,7 @@ set(G2O_LIBS
   g2o_csparse_extension
 )
 
-# Generate headers from your .srv files
+# ── Generate headers from .srv files ──────────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/AddEdge.srv"
   "srv/AddNode.srv"
@@ -63,6 +64,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 
+# ── Helper macro for C++ SLAM nodes ──────────────────────────────────────────
 macro(slam_node name src)
   add_executable(${name} ${src})
   ament_target_dependencies(${name} ${AMENT_DEPS})
@@ -82,18 +84,17 @@ slam_node(loop_closure     src/loop_closure.cpp)
 slam_node(occupancy_mapper src/occupancy_mapper.cpp)
 slam_node(graph_optimizer  src/graph_optimizer.cpp)
 
-
 target_link_libraries(graph_optimizer
   ${G2O_LIBS}
   pthread
 )
-
 
 target_link_libraries(loop_closure
   ${G2O_LIBS}
   pthread
 )
 
+# ── Install C++ executables ───────────────────────────────────────────────────
 install(TARGETS
   graph_manager
   pipeline
@@ -104,6 +105,14 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# ── Install Python scripts (keeps the .py extension so ROS 2 finds them) ─────
+# PROGRAMS sets executable permission automatically (chmod +x).
+install(PROGRAMS
+  scripts/pose_printer.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# ── Install resource directories ──────────────────────────────────────────────
 install(DIRECTORY launch/  DESTINATION share/${PROJECT_NAME}/launch)
 install(DIRECTORY config/  DESTINATION share/${PROJECT_NAME}/config)
 install(DIRECTORY rviz/    DESTINATION share/${PROJECT_NAME}/rviz)

@@ -3,12 +3,14 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 
+
 def generate_launch_description():
     pkg = get_package_share_directory('graph_slam')
     amcl_params = os.path.join(pkg, 'config', 'amcl_params.yaml')
 
     return LaunchDescription([
 
+        # ── AMCL localisation ────────────────────────────────────────────
         Node(
             package='nav2_amcl',
             executable='amcl',
@@ -17,16 +19,27 @@ def generate_launch_description():
             parameters=[amcl_params],
         ),
 
+        # ── Lifecycle manager (starts AMCL automatically) ────────────────
         Node(
             package='nav2_lifecycle_manager',
             executable='lifecycle_manager',
             name='lifecycle_manager_localization',
             output='screen',
             parameters=[{
-                'use_sim_time': False,
+                'use_sim_time': True,
                 'autostart':    True,
                 'node_names':   ['amcl'],
             }],
         ),
 
+        # ── Pose printer (subscribes to /amcl_pose, prints every 1 s) ───
+        Node(
+            package='graph_slam',
+            executable='pose_printer.py',
+            name='pose_printer',
+            output='screen',
+            parameters=[{
+                'use_sim_time': True,
+            }],
+        ),
     ])

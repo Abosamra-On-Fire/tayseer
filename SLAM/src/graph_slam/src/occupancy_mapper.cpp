@@ -29,7 +29,7 @@ public:
         map_height_m_       = declare_parameter<double>("map_height_m",       40.0);
         publish_period_sec_ = declare_parameter<double>("publish_period_sec", 0.05);
         map_angle_step_deg_ = declare_parameter<double>("map_angle_step_deg", 0.5);
-        fov_half_deg_       = declare_parameter<double>("fov_half_deg",       135.0);
+        fov_half_deg_       = declare_parameter<double>("fov_half_deg",       60.0);
 
         width_cells_  = map_width_m_  / map_resolution_;
         height_cells_ = map_height_m_ / map_resolution_;
