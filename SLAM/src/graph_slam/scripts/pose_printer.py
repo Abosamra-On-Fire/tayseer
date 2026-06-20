@@ -13,8 +13,6 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 class PosePrinter(Node):
     def __init__(self):
         super().__init__('pose_printer')
-        # NOTE: do NOT declare 'use_sim_time' — ROS 2 Humble declares it
-        # automatically. Declaring it again raises ParameterAlreadyDeclaredException.
 
         self.create_subscription(
             PoseWithCovarianceStamped,

@@ -3,203 +3,299 @@
 #include "graph_slam/srv/scan_match.hpp"
 #include "types.hpp"
 #include <Eigen/Dense>
-#include <Eigen/SVD>
+#include <Eigen/Eigenvalues>
 #include <cmath>
 #include <vector>
 #include <limits>
+#include <algorithm>
 
 using namespace std;
 namespace graph_slam {
 
-vector<Point2D> scanToCloud(sensor_msgs::msg::LaserScan& scan, double bucket_deg)
+vector<Point2D> scanToCloud(sensor_msgs::msg::LaserScan& scan)
 {
     vector<Point2D> cloud;
-    if (scan.ranges.empty()) 
-        return cloud;
-    double bucket_rad = bucket_deg * M_PI / 180.0;
-    int num_buckets = max(1, static_cast<int>(ceil((scan.angle_max - scan.angle_min) / bucket_rad)));
-
-    vector<float> best_r(num_buckets, numeric_limits<float>::max());
-    vector<float> best_a(num_buckets, 0.0f);
-
-    float angle = scan.angle_min;
+    cloud.reserve(scan.ranges.size());
+    double angle = scan.angle_min;
     for (size_t i = 0; i < scan.ranges.size(); ++i)
     {
-        float r = scan.ranges[i];
+        double r = scan.ranges[i];
         if (!isfinite(r) || r <= scan.range_min || r >= scan.range_max)
-            { angle += scan.angle_increment; continue; }
-        int bucket = static_cast<int>((angle - scan.angle_min) / bucket_rad);
-        if (bucket < 0 || bucket >= num_buckets)
-            { angle += scan.angle_increment; continue; }
-        if (r < best_r[bucket]) { best_r[bucket] = r; best_a[bucket] = angle; }
+        {
+            angle += scan.angle_increment;
+            continue;
+        }
+        cloud.push_back({r*cos(angle), r*sin(angle)});
         angle += scan.angle_increment;
     }
-    cloud.reserve(num_buckets);
-    for (int b = 0; b < num_buckets; ++b)
-        if (best_r[b] < numeric_limits<float>::max())
-            cloud.push_back({ best_r[b]*cos(best_a[b]), best_r[b]*sin(best_a[b]) });
     return cloud;
 }
 
-vector<Point2D> applyTransform(vector<Point2D> cloud, double dx, double dy, double dtheta)
+Eigen::Matrix2d R(double theta)
 {
-    double c = cos(dtheta), s = sin(dtheta);
+    double c = cos(theta), s = sin(theta);
+    Eigen::Matrix2d M;
+    M << c, -s,
+         s,  c;
+    return M;
+}
+
+vector<Point2D> applyTransform(vector<Point2D> cloud, double tx, double ty, double theta)
+{
+    Eigen::Matrix2d Rm = R(theta);
     vector<Point2D> out(cloud.size());
-    for (size_t i = 0; i < cloud.size(); ++i) {
-        Point2D p = cloud[i];
-        out[i] = { c*p.x - s*p.y + dx, s*p.x + c*p.y + dy };
+    for (size_t i = 0; i < cloud.size(); ++i)
+    {
+        Eigen::Vector2d p(cloud[i].x, cloud[i].y);
+        Eigen::Vector2d pw = Rm*p + Eigen::Vector2d(tx, ty);
+        out[i] = { pw(0), pw(1) };
     }
     return out;
 }
 
-struct LineFeature {
-    Eigen::Vector2d point;
-    Eigen::Vector2d normal;
+struct Correspondence {
+    int i;
+    int j1;
+    int j2;
     bool valid = false;
 };
 
-vector<LineFeature> extractLines(Cloud cloud, int k_neighbours = 10)
+vector<Correspondence> findCorrespondences(Cloud transformed, Cloud ref)
 {
-    int N = static_cast<int>(cloud.size());
-    vector<LineFeature> features(N);
-
-    for (int i = 0; i < N; ++i)
+    vector<Correspondence> C(transformed.size());
+    int M =ref.size();
+    for (int i = 0; i < transformed.size(); ++i)
     {
-        vector<pair<double,int>> dists;
-        dists.reserve(N);
-        for (int j = 0; j < N; ++j) {
-            double dx = cloud[i].x - cloud[j].x, dy = cloud[i].y - cloud[j].y;
-            dists.push_back({dx*dx + dy*dy, j});
-        }
-        int actual_k = min(k_neighbours, N);
-        partial_sort(dists.begin(), dists.begin()+actual_k, dists.end());
-
-        double mx = 0, my = 0;
-        for (int ki = 0; ki < actual_k; ++ki) {
-            mx += cloud[dists[ki].second].x;
-            my += cloud[dists[ki].second].y;
-        }
-        mx /= actual_k; my /= actual_k;
-
-        Eigen::Matrix2d cov = Eigen::Matrix2d::Zero();
-        for (int ki = 0; ki < actual_k; ++ki) {
-            Eigen::Vector2d d(cloud[dists[ki].second].x - mx,
-                              cloud[dists[ki].second].y - my);
-            cov += d * d.transpose();
-        }
-        cov /= actual_k;
-
-        Eigen::JacobiSVD<Eigen::Matrix2d> svd(cov, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Vector2d normal = svd.matrixU().col(1);
-
-        double l0 = svd.singularValues()(0);
-        double l1 = svd.singularValues()(1);
-        if (l0 < 1e-9 || l1/l0 > 0.5) continue;
-
-        features[i].point  = Eigen::Vector2d(mx, my);
-        features[i].normal = normal;
-        features[i].valid  = true;
-    }
-    return features;
-}
-
-struct Association {
-    int    src_idx;
-    int    tgt_idx;
-    double perp_dist;
-};
-
-vector<Association> associatePointToLine(Cloud src, Cloud target,
-                                          vector<LineFeature> features, double max_dist)
-{
-    vector<Association> assoc;
-    assoc.reserve(src.size());
-
-    for (size_t i = 0; i < src.size(); ++i)
-    {
-        double best_dist_sq = max_dist * max_dist;
-        int    best_j = -1;
-
-        for (size_t j = 0; j < target.size(); ++j)
+        double best1 = numeric_limits<double>::max();
+        double best2 = numeric_limits<double>::max();
+        int j1 = -1, j2 = -1;
+        for (int j = 0; j < M; ++j)
         {
-            if (!features[j].valid) continue;
-            double dx = src[i].x - target[j].x, dy = src[i].y - target[j].y;
+            double dx = transformed[i].x - ref[j].x;
+            double dy = transformed[i].y - ref[j].y;
             double d2 = dx*dx + dy*dy;
-            if (d2 < best_dist_sq) { best_dist_sq = d2; best_j = j; }
+            if (d2 < best1)
+            {
+                best2 = best1; 
+                j2 = j1;
+                best1 = d2; 
+                j1 = j;
+            }
+            else if (d2 < best2)
+            {
+                best2 = d2; j2 = j;
+            }
         }
-        if (best_j < 0) continue;
-
-        Eigen::Vector2d diff(src[i].x - features[best_j].point(0),
-                             src[i].y - features[best_j].point(1));
-        double pd = features[best_j].normal.dot(diff);
-        assoc.push_back({static_cast<int>(i), best_j, pd});
+        if (j1 < 0 || j2 < 0)
+        {
+            C[i].valid = false;
+            continue;
+        }
+        C[i].i = i;
+        C[i].j1 = j1;
+        C[i].j2 = j2;
+        C[i].valid = true;
     }
-    return assoc;
+    return C;
 }
 
-bool computeTransformPointToLine(Cloud src, vector<Association> assoc,
-                                  vector<LineFeature> features,
-                                  double& dx, double& dy, double& dtheta)
+vector<Correspondence> trimCorrespondences(Cloud transformed, Cloud ref,vector<Correspondence> C, double trim_ratio)
 {
-    if (assoc.size() < 3) return false;
-
-    Eigen::MatrixXd A(assoc.size(), 4);
-    Eigen::VectorXd b(assoc.size());
-
-    for (int k = 0; k < static_cast<int>(assoc.size()); ++k)
+    vector<pair<double,int>> errors;
+    errors.reserve(C.size());
+    for (int k = 0; k < C.size(); ++k)
     {
-        auto& a  = assoc[k];
-        auto& lf = features[a.tgt_idx];
-        double px = src[a.src_idx].x, py = src[a.src_idx].y;
-        double nx = lf.normal(0),     ny = lf.normal(1);
-        double qx = lf.point(0),      qy = lf.point(1);
-
-        double np  =  nx*px + ny*py;
-        double ncr = -nx*py + ny*px;
-
-        A(k, 0) = np;
-        A(k, 1) = ncr;
-        A(k, 2) = nx;
-        A(k, 3) = ny;
-
-        b(k) = nx*qx + ny*qy - np;
+        if (!C[k].valid) 
+        {
+            continue;
+        }
+        Eigen::Vector2d pj1(ref[C[k].j1].x, ref[C[k].j1].y);
+        Eigen::Vector2d pj2(ref[C[k].j2].x, ref[C[k].j2].y);
+        Eigen::Vector2d d = pj2 - pj1;
+        double len = d.norm();
+        if (len < 1e-12) 
+        {
+            continue;
+        }
+        Eigen::Vector2d n(-d(1)/len, d(0)/len);
+        Eigen::Vector2d pw(transformed[C[k].i].x, transformed[C[k].i].y);
+        double e = n.dot(pw - pj1);
+        errors.push_back({e*e, k});
     }
-
-    Eigen::Matrix4d ATA = A.transpose() * A;
-    Eigen::Vector4d ATb = A.transpose() * b;
-
-    if (std::abs(ATA.determinant()) < 1e-12) return false;
-
-    Eigen::Vector4d x = ATA.ldlt().solve(ATb);
-
-    double c1 = x(0), s1 = x(1);
-    dtheta = atan2(s1, c1 + 1.0);
-    dx     = x(2);
-    dy     = x(3);
-
-    if (!isfinite(dx) || !isfinite(dy) || !isfinite(dtheta)) return false;
-
-    const double MAX_STEP_T = 2.0, MAX_STEP_R = M_PI;
-    if (fabs(dx) > MAX_STEP_T || fabs(dy) > MAX_STEP_T || fabs(dtheta) > MAX_STEP_R)
+    sort(errors.begin(), errors.end());
+    int keep = trim_ratio * errors.size();
+    vector<Correspondence> Ctrim;
+    Ctrim.reserve(keep);
+    for (int k = 0; k < keep && k < errors.size(); ++k)
     {
-        dx     = max(-MAX_STEP_T, min(MAX_STEP_T, dx));
-        dy     = max(-MAX_STEP_T, min(MAX_STEP_T, dy));
-        dtheta = max(-MAX_STEP_R, min(MAX_STEP_R, dtheta));
+        Ctrim.push_back(C[errors[k].second]);
     }
-
-    return true;
+    return Ctrim;
 }
 
-double fitnessScorePointToLine(vector<Association> assoc)
+double polishedCost(Cloud src, vector<Correspondence> C, Cloud ref, Eigen::Vector4d x)
 {
-    if (assoc.empty()) return numeric_limits<double>::max();
     double total = 0;
-    for (auto& a : assoc) total += a.perp_dist * a.perp_dist;
-    return total / assoc.size();
+    for (int k = 0; k < C.size(); ++k)
+    {
+        Eigen::Vector2d pj1(ref[C[k].j1].x, ref[C[k].j1].y);
+        Eigen::Vector2d pj2(ref[C[k].j2].x, ref[C[k].j2].y);
+        Eigen::Vector2d d = pj2 - pj1;
+        double len = d.norm();
+        if (len < 1e-12) 
+        {
+            continue;
+        }
+        Eigen::Vector2d n(-d(1)/len, d(0)/len);
+        Eigen::Matrix2d Ci = n*n.transpose();
+        double p0 = src[C[k].i].x, p1 = src[C[k].i].y;
+        Eigen::Matrix<double,2,4> Mi;
+        Mi << 1, 0, p0, -p1,
+              0, 1, p1,  p0;
+        Eigen::Vector2d e = Mi*x - pj1;
+        total += e.transpose()*Ci*e;
+    }
+    return total;
 }
 
-void composeSE2(double ax, double ay, double ath,
-                double bx, double by, double bth,
+vector<double> solveQuartic(double a4, double a3, double a2, double a1, double a0)
+{
+    vector<double> roots;
+    if (fabs(a4) < 1e-15) 
+    {
+        return roots;
+    }
+    Eigen::Matrix4d comp = Eigen::Matrix4d::Zero();
+    comp(0,1) = 1; 
+    comp(1,2) = 1; 
+    comp(2,3) = 1;
+    comp(3,0) = -a0/a4;
+    comp(3,1) = -a1/a4;
+    comp(3,2) = -a2/a4;
+    comp(3,3) = -a3/a4;
+    Eigen::EigenSolver<Eigen::Matrix4d> es(comp);
+    for (int k = 0; k < 4; ++k)
+    {
+        if (fabs(es.eigenvalues()(k).imag()) < 1e-6)
+            roots.push_back(es.eigenvalues()(k).real());
+    }
+    return roots;
+}
+
+bool computeTransformPLICP(Cloud src, vector<Correspondence> C, Cloud ref,
+                            double& dx, double& dy, double& dtheta)
+{
+    if (C.size() < 3) return false;
+
+    Eigen::Matrix4d Macc = Eigen::Matrix4d::Zero();
+    Eigen::Vector4d g = Eigen::Vector4d::Zero();
+
+    for (auto& c : C)
+    {
+        Eigen::Vector2d pj1(ref[c.j1].x, ref[c.j1].y);
+        Eigen::Vector2d pj2(ref[c.j2].x, ref[c.j2].y);
+        Eigen::Vector2d d = pj2 - pj1;
+        double len = d.norm();
+        if (len < 1e-12) continue;
+        Eigen::Vector2d n(-d(1)/len, d(0)/len);
+        Eigen::Matrix2d Ci = n*n.transpose();
+
+        double p0 = src[c.i].x, p1 = src[c.i].y;
+        Eigen::Matrix<double,2,4> Mi;
+        Mi << 1, 0, p0, -p1,
+              0, 1, p1,  p0;
+
+        Macc += Mi.transpose()*Ci*Mi;
+        g    += -2.0 * Mi.transpose()*Ci*pj1;
+    }
+
+    Eigen::Matrix4d Wm = Eigen::Matrix4d::Zero();
+    Wm(2,2) = 1; Wm(3,3) = 1;
+
+    Eigen::Matrix2d A2 = 2.0*Macc.block<2,2>(0,0);
+    Eigen::Matrix2d B2 = 2.0*Macc.block<2,2>(0,2);
+    Eigen::Matrix2d D2 = 2.0*Macc.block<2,2>(2,2);
+
+    if (fabs(A2.determinant()) < 1e-12) return false;
+    Eigen::Matrix2d Ainv = A2.inverse();
+    Eigen::Matrix2d P = Ainv*B2;
+    Eigen::Matrix2d S = D2 - B2.transpose()*P;
+
+    double Tt = S.trace();
+    double Dt = S.determinant();
+    Eigen::Matrix2d Sadj;
+    Sadj << S(1,1), -S(0,1),
+           -S(1,0),  S(0,0);
+
+    Eigen::Vector2d g1 = g.segment<2>(0);
+    Eigen::Vector2d g2 = g.segment<2>(2);
+    Eigen::Vector2d v = P.transpose()*g1;
+    Eigen::Vector2d w = v - g2;
+
+    double c2 = 4.0*w.dot(w);
+    double c1 = 4.0*w.dot(Sadj*w);
+    Eigen::Vector2d Sw = Sadj*w;
+    double c0 = Sw.dot(Sw);
+
+    double a4 = 16.0;
+    double a3 = 16.0*Tt;
+    double a2 = 4.0*Tt*Tt + 8.0*Dt - c2;
+    double a1 = 4.0*Tt*Dt - c1;
+    double a0 = Dt*Dt - c0;
+
+    vector<double> roots = solveQuartic(a4, a3, a2, a1, a0);
+    if (roots.empty()) return false;
+
+    bool found = false;
+    double best_cost = numeric_limits<double>::max();
+    Eigen::Vector4d best_x;
+
+    for (double lambda : roots)
+    {
+        Eigen::Matrix4d Z = 2.0*Macc + 2.0*lambda*Wm;
+        if (fabs(Z.determinant()) < 1e-12) continue;
+        Eigen::Vector4d x = -Z.inverse()*g;
+        double norm2 = x(2)*x(2) + x(3)*x(3);
+        if (!isfinite(norm2) || norm2 < 1e-9) continue;
+        double scale = 1.0/sqrt(norm2);
+        x(2) *= scale; x(3) *= scale;
+
+        double cost = polishedCost(src, C, ref, x);
+        if (cost < best_cost)
+        {
+            best_cost = cost;
+            best_x = x;
+            found = true;
+        }
+    }
+    if (!found) return false;
+
+    dx = best_x(0);
+    dy = best_x(1);
+    dtheta = atan2(best_x(3), best_x(2));
+    return isfinite(dx) && isfinite(dy) && isfinite(dtheta);
+}
+
+double fitnessScorePLICP(Cloud transformed, vector<Correspondence> C, Cloud ref)
+{
+    if (C.empty()) return numeric_limits<double>::max();
+    double total = 0;
+    for (auto& c : C)
+    {
+        Eigen::Vector2d pj1(ref[c.j1].x, ref[c.j1].y);
+        Eigen::Vector2d pj2(ref[c.j2].x, ref[c.j2].y);
+        Eigen::Vector2d d = pj2 - pj1;
+        double len = d.norm();
+        if (len < 1e-12) continue;
+        Eigen::Vector2d n(-d(1)/len, d(0)/len);
+        Eigen::Vector2d pw(transformed[c.i].x, transformed[c.i].y);
+        double e = n.dot(pw - pj1);
+        total += e*e;
+    }
+    return total / C.size();
+}
+
+void composeSE2(double ax, double ay, double ath, double bx, double by, double bth,
                 double& ox, double& oy, double& oth)
 {
     double ca = cos(ath), sa = sin(ath);
@@ -216,70 +312,69 @@ public:
         max_iterations_     = this->declare_parameter("max_iterations",     50);
         max_correspondence_ = this->declare_parameter("max_correspondence", 0.6);
         fitness_threshold_  = this->declare_parameter("fitness_threshold",  0.05);
-        transformation_eps_ = this->declare_parameter("transformation_eps", 1e-6);
-        downsample_deg_     = this->declare_parameter("downsample_deg",     0.5);
-        line_neighbours_    = this->declare_parameter("line_neighbours",    10);
+        trim_ratio_         = this->declare_parameter("trim_ratio",         0.9);
 
         svc_ = this->create_service<graph_slam::srv::ScanMatch>(
             "graph_slam/scan_match",
             std::bind(&ScanMatcher::matchCallback, this,
                       std::placeholders::_1, std::placeholders::_2));
 
-        RCLCPP_INFO(this->get_logger(), "[ScanMatcher] Point-to-line ICP ready. "
-                 "downsample=%.1fdeg max_corr=%.2fm line_k=%d",
-                 downsample_deg_, max_correspondence_, line_neighbours_);
+        RCLCPP_INFO(this->get_logger(), "[ScanMatcher] PL-ICP ready.");
     }
 
 private:
     rclcpp::Service<graph_slam::srv::ScanMatch>::SharedPtr svc_;
-    int    max_iterations_, line_neighbours_;
-    double max_correspondence_, fitness_threshold_, transformation_eps_;
-    double downsample_deg_;
+    int    max_iterations_;
+    double max_correspondence_, fitness_threshold_, trim_ratio_;
 
     void matchCallback(const std::shared_ptr<graph_slam::srv::ScanMatch::Request> req,
                        std::shared_ptr<graph_slam::srv::ScanMatch::Response> res)
     {
-        Cloud ref  = scanToCloud(req->reference_scan, downsample_deg_);
-        Cloud curr = scanToCloud(req->current_scan,   downsample_deg_);
-        if (ref.empty() || curr.empty()) { res->success = false; return; }
-
-        vector<LineFeature> ref_lines = extractLines(ref, line_neighbours_);
+        Cloud ref  = scanToCloud(req->reference_scan);
+        Cloud curr = scanToCloud(req->current_scan);
+        if (ref.empty() || curr.empty())
+        {
+            res->success = false;
+            return;
+        }
 
         double acc_dx  = req->init_dx;
         double acc_dy  = req->init_dy;
         double acc_dth = req->init_dtheta;
 
         Cloud transformed = applyTransform(curr, acc_dx, acc_dy, acc_dth);
-        double prev_score = numeric_limits<double>::max();
+
+        vector<Correspondence> last_assoc;
 
         for (int iter = 0; iter < max_iterations_; ++iter)
         {
-            auto assoc = associatePointToLine(transformed, ref, ref_lines, max_correspondence_);
-            if (assoc.size() < 6) break;
+            auto C0 = findCorrespondences(transformed, ref);
+            auto C1 = trimCorrespondences(transformed, ref, C0, trim_ratio_);
+            if (C1.size() < 3) { last_assoc = C1; break; }
 
             double sdx, sdy, sdth;
-            if (!computeTransformPointToLine(transformed, assoc, ref_lines, sdx, sdy, sdth))
+            if (!computeTransformPLICP(transformed, C1, ref, sdx, sdy, sdth))
+            {
+                last_assoc = C1;
                 break;
+            }
 
             double ndx, ndy, ndth;
             composeSE2(sdx, sdy, sdth, acc_dx, acc_dy, acc_dth, ndx, ndy, ndth);
             acc_dx = ndx; acc_dy = ndy; acc_dth = ndth;
 
             transformed = applyTransform(transformed, sdx, sdy, sdth);
+            last_assoc = C1;
 
-            double score = fitnessScorePointToLine(assoc);
-
-            double step_mag = sdx*sdx + sdy*sdy + sdth*sdth;
-            if (step_mag < transformation_eps_) break;
-
-            if (score > prev_score * 1.5 && iter > 5) break;
-            prev_score = score;
+            if (fabs(sdx) < 1e-9 && fabs(sdy) < 1e-9 && fabs(sdth) < 1e-9) break;
         }
 
-        auto final_assoc = associatePointToLine(transformed, ref, ref_lines, max_correspondence_);
-        double score = fitnessScorePointToLine(final_assoc);
+        auto final_C0 = findCorrespondences(transformed, ref);
+        auto final_C1 = trimCorrespondences(transformed, ref, final_C0, trim_ratio_);
+        double score = fitnessScorePLICP(transformed, final_C1, ref);
 
-        if (score > fitness_threshold_ || final_assoc.size() < 6) {
+        if (score > fitness_threshold_ || final_C1.size() < 3)
+        {
             res->success = false;
             res->score   = score;
             return;
@@ -306,8 +401,7 @@ private:
     }
 };
 
-} // namespace graph_slam
-
+}
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
