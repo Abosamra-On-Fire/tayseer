@@ -28,11 +28,7 @@ def generate_launch_description():
             executable = "graph_manager",
             name       = "graph_manager",
             output     = "screen",
-            parameters = [{
-                "node_scale": 0.05,
-                "edge_width": 0.02,
-                **sim_time_param,
-            }],
+
         ),
 
         # ── 2. Scan Matcher (point-to-line ICP service) ───────────────────────
@@ -41,15 +37,7 @@ def generate_launch_description():
             executable = "scan_matcher",
             name       = "scan_matcher",
             output     = "screen",
-            parameters = [{
-                "max_iterations":     50,
-                "max_correspondence": 0.6,
-                "fitness_threshold":  0.05,
-                "transformation_eps": 1e-6,
-                "downsample_deg":     0.5,
-                "line_neighbours":    10,
-                **sim_time_param,
-            }],
+
         ),
 
         # ── 3. Graph Pipeline (keyframe + odometry edges) ─────────────────────
@@ -58,15 +46,6 @@ def generate_launch_description():
             executable = "pipeline",
             name       = "pipeline",
             output     = "screen",
-            parameters = [{
-                "min_dist_m":                   0.3,
-                "min_angle_deg":                30.0,
-                "use_scan_matching_from_odom":  True,
-                "fallback_to_odom_on_icp_fail": True,
-                "corridor_degeneracy_thr":      0.05,
-                "icp_score_threshold":          0.05,
-                **sim_time_param,
-            }],
             remappings = [
                 ("limo/scan", "/scan"),
             ],
@@ -78,19 +57,7 @@ def generate_launch_description():
             executable = "loop_closure",
             name       = "loop_closure",
             output     = "screen",
-            parameters = [{
-                "max_range":           3.0,
-                "min_node_separation": 40,
-                "num_candidates":      5,
-                "sc_threshold":        0.15,
-                "icp_threshold":       0.02,
-                "max_lc_per_tick":     1,
-                "period_sec":          8.0,
-                "max_icp_translation": 0.5,
-                "query_window":        5,
-                "max_euclidean_dist":  3.0,
-                **sim_time_param,
-            }],
+
         ),
 
         # ── 5. Graph Optimizer (g2o pose-graph) ───────────────────────────────
@@ -99,17 +66,7 @@ def generate_launch_description():
             executable = "graph_optimizer",
             name       = "graph_optimizer",
             output     = "screen",
-            parameters = [{
-                "optimize_every_n":     10,
-                "maximum_iterations":   50,
-                "check_period_sec":     2.0,
-                "huber_delta":          0.3,
-                "phase1_iterations":    30,
-                "lc_chi2_threshold":    15.0,
-                "do_outlier_rejection": True,
-                "min_lc_to_optimize":   2,
-                **sim_time_param,
-            }],
+
         ),
 
         # ── 6. Occupancy Mapper (incremental + particle filter localisation) ──
@@ -118,26 +75,6 @@ def generate_launch_description():
             executable = "occupancy_mapper",
             name       = "occupancy_mapper",
             output     = "screen",
-            parameters = [{
-                "map_resolution":      0.05,
-                "map_width_m":         40.0,
-                "map_height_m":        40.0,
-                "publish_period_sec":  0.05,
-                "map_angle_step_deg":  0.5,
-                "fov_half_deg":        60.0,
-                "localization_enabled": True,
-                "num_particles":        500,
-                "particle_sigma_x":     0.1,
-                "particle_sigma_y":     0.1,
-                "particle_sigma_theta": 0.05,
-                "motion_sigma_x":       0.02,
-                "motion_sigma_y":       0.02,
-                "motion_sigma_theta":   0.01,
-                "resample_threshold":   0.5,
-                "scan_subsample":       8,
-                "odom_frame":           "odom",
-                "base_frame":           "base_link",
-                **sim_time_param,
-            }],
+
         ),
     ])

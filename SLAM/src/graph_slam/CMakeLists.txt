@@ -61,6 +61,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetGraph.srv"
   "srv/ScanMatch.srv"
   "srv/UpdatePoses.srv"
+  "srv/RemoveEdge.srv"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 

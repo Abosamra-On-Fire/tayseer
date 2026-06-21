@@ -9,6 +9,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 
 using namespace std;
 namespace graph_slam {
@@ -27,7 +28,7 @@ public:
         map_resolution_     = declare_parameter<double>("map_resolution",     0.05);
         map_width_m_        = declare_parameter<double>("map_width_m",        40.0);
         map_height_m_       = declare_parameter<double>("map_height_m",       40.0);
-        publish_period_sec_ = declare_parameter<double>("publish_period_sec", 0.05);
+        publish_period_sec_ = declare_parameter<double>("publish_period_sec", 0.5);
         map_angle_step_deg_ = declare_parameter<double>("map_angle_step_deg", 0.5);
         fov_half_deg_       = declare_parameter<double>("fov_half_deg",       60.0);
 
@@ -55,7 +56,6 @@ public:
             "graph_slam/get_graph",
             rmw_qos_profile_services_default,
             cb_group_get_graph_);
-        clt_get_graph_->wait_for_service();
 
         timer_ = create_wall_timer(
             std::chrono::duration<double>(publish_period_sec_),
@@ -88,8 +88,7 @@ private:
     vector<double> log_odds_;
 
     int  last_mapped_node_ = -1;
-
-
+    std::atomic<bool> incremental_in_flight_{false};
 
     void triggerCallback(std_msgs::msg::Bool::SharedPtr msg)
     {
@@ -99,54 +98,50 @@ private:
         fill(log_odds_.begin(), log_odds_.end(), 0.0);
         last_mapped_node_ = -1;
 
-        auto resp = callGetGraph();
-        if (!resp) return;
+        auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
+        clt_get_graph_->async_send_request(req,
+            [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture f) {
+            auto resp = f.get();
+            if (!resp) return;
 
-        int N = static_cast<int>(resp->ids.size());
-        if (N == 0) { RCLCPP_WARN(get_logger(), "[OccupancyMapper] Graph empty"); return; }
+            int N = static_cast<int>(resp->ids.size());
+            if (N == 0) { RCLCPP_WARN(get_logger(), "[OccupancyMapper] Graph empty"); return; }
 
-        for (int i = 0; i < N; ++i)
-            insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
+            for (int i = 0; i < N; ++i)
+                insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
 
-        last_mapped_node_ = N - 1;
-        publishMap();
-        RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild done: %d nodes", N);
+            last_mapped_node_ = N - 1;
+            publishMap();
+            RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild done: %d nodes", N);
+        });
     }
-
 
     void incrementalUpdate()
     {
-        auto resp = callGetGraph();
-        if (!resp) return;
+        bool expected = false;
+        if (!incremental_in_flight_.compare_exchange_strong(expected, true)) return;
+        auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
+        clt_get_graph_->async_send_request(req,
+            [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture f) {
+            incremental_in_flight_ = false;
+            auto resp = f.get();
+            if (!resp) return;
 
-        int N = static_cast<int>(resp->ids.size());
-        bool changed = false;
-        for (int i = last_mapped_node_ + 1; i < N; ++i) {
-            insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
-            changed = true;
-        }
-        if (changed) {
-            last_mapped_node_ = N - 1;
-            publishMap();
-        }
+            int N = static_cast<int>(resp->ids.size());
+            bool changed = false;
+            for (int i = last_mapped_node_ + 1; i < N; ++i) {
+                insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
+                changed = true;
+            }
+            if (changed) {
+                last_mapped_node_ = N - 1;
+                publishMap();
+            }
+        });
     }
-
-
-    graph_slam::srv::GetGraph::Response::SharedPtr callGetGraph()
-    {
-        auto req    = std::make_shared<graph_slam::srv::GetGraph::Request>();
-        auto future = clt_get_graph_->async_send_request(req);
-        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                "[OccupancyMapper] get_graph timed out");
-            return nullptr;
-        }
-        return future.get();
-    }
-
 
     void insertScan(double x, double y, double theta,
-                    sensor_msgs::msg::LaserScan& scan)
+                    const sensor_msgs::msg::LaserScan& scan)
     {
         if (scan.ranges.empty()) return;
 
@@ -228,7 +223,6 @@ private:
         double origin = is_x ? origin_x_ : origin_y_;
         return static_cast<int>((coord - origin) / map_resolution_);
     }
-
 
     void publishMap()
     {

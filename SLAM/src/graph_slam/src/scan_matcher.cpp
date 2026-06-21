@@ -60,10 +60,11 @@ struct Correspondence {
     bool valid = false;
 };
 
-vector<Correspondence> findCorrespondences(Cloud transformed, Cloud ref)
+vector<Correspondence> findCorrespondences(Cloud transformed, Cloud ref, double max_correspondence_dist)
 {
     vector<Correspondence> C(transformed.size());
-    int M =ref.size();
+    int M = ref.size();
+    double max_d2 = max_correspondence_dist * max_correspondence_dist;
     for (int i = 0; i < transformed.size(); ++i)
     {
         double best1 = numeric_limits<double>::max();
@@ -76,17 +77,18 @@ vector<Correspondence> findCorrespondences(Cloud transformed, Cloud ref)
             double d2 = dx*dx + dy*dy;
             if (d2 < best1)
             {
-                best2 = best1; 
+                best2 = best1;
                 j2 = j1;
-                best1 = d2; 
+                best1 = d2;
                 j1 = j;
             }
             else if (d2 < best2)
             {
-                best2 = d2; j2 = j;
+                best2 = d2;
+                j2 = j;
             }
         }
-        if (j1 < 0 || j2 < 0)
+        if (j1 < 0 || j2 < 0 || best1 > max_d2)
         {
             C[i].valid = false;
             continue;
@@ -99,13 +101,13 @@ vector<Correspondence> findCorrespondences(Cloud transformed, Cloud ref)
     return C;
 }
 
-vector<Correspondence> trimCorrespondences(Cloud transformed, Cloud ref,vector<Correspondence> C, double trim_ratio)
+vector<Correspondence> trimCorrespondences(Cloud transformed, Cloud ref, vector<Correspondence> C, double trim_ratio)
 {
     vector<pair<double,int>> errors;
     errors.reserve(C.size());
     for (int k = 0; k < C.size(); ++k)
     {
-        if (!C[k].valid) 
+        if (!C[k].valid)
         {
             continue;
         }
@@ -113,7 +115,7 @@ vector<Correspondence> trimCorrespondences(Cloud transformed, Cloud ref,vector<C
         Eigen::Vector2d pj2(ref[C[k].j2].x, ref[C[k].j2].y);
         Eigen::Vector2d d = pj2 - pj1;
         double len = d.norm();
-        if (len < 1e-12) 
+        if (len < 1e-12)
         {
             continue;
         }
@@ -123,7 +125,8 @@ vector<Correspondence> trimCorrespondences(Cloud transformed, Cloud ref,vector<C
         errors.push_back({e*e, k});
     }
     sort(errors.begin(), errors.end());
-    int keep = trim_ratio * errors.size();
+    int keep = static_cast<int>(trim_ratio * errors.size());
+    if (keep < 3 && errors.size() >= 3) keep = 3;
     vector<Correspondence> Ctrim;
     Ctrim.reserve(keep);
     for (int k = 0; k < keep && k < errors.size(); ++k)
@@ -142,7 +145,7 @@ double polishedCost(Cloud src, vector<Correspondence> C, Cloud ref, Eigen::Vecto
         Eigen::Vector2d pj2(ref[C[k].j2].x, ref[C[k].j2].y);
         Eigen::Vector2d d = pj2 - pj1;
         double len = d.norm();
-        if (len < 1e-12) 
+        if (len < 1e-12)
         {
             continue;
         }
@@ -161,13 +164,21 @@ double polishedCost(Cloud src, vector<Correspondence> C, Cloud ref, Eigen::Vecto
 vector<double> solveQuartic(double a4, double a3, double a2, double a1, double a0)
 {
     vector<double> roots;
-    if (fabs(a4) < 1e-15) 
+    if (fabs(a4) < 1e-15)
     {
+        if (fabs(a3) > 1e-15) {
+            double a = a2/a3, b = a1/a3, c = a0/a3;
+            double disc = b*b - 4*a*c;
+            if (disc >= 0) {
+                roots.push_back((-b + sqrt(disc)) / 2.0);
+                roots.push_back((-b - sqrt(disc)) / 2.0);
+            }
+        }
         return roots;
     }
     Eigen::Matrix4d comp = Eigen::Matrix4d::Zero();
-    comp(0,1) = 1; 
-    comp(1,2) = 1; 
+    comp(0,1) = 1;
+    comp(1,2) = 1;
     comp(2,3) = 1;
     comp(3,0) = -a0/a4;
     comp(3,1) = -a1/a4;
@@ -309,9 +320,9 @@ class ScanMatcher : public rclcpp::Node
 public:
     ScanMatcher() : Node("scan_matcher")
     {
-        max_iterations_     = this->declare_parameter("max_iterations",     50);
-        max_correspondence_ = this->declare_parameter("max_correspondence", 0.6);
-        fitness_threshold_  = this->declare_parameter("fitness_threshold",  0.05);
+        max_iterations_     = this->declare_parameter("max_iterations",     100);
+        max_correspondence_ = this->declare_parameter("max_correspondence", 0.8);
+        fitness_threshold_  = this->declare_parameter("fitness_threshold",  0.12);
         trim_ratio_         = this->declare_parameter("trim_ratio",         0.9);
 
         svc_ = this->create_service<graph_slam::srv::ScanMatch>(
@@ -348,7 +359,7 @@ private:
 
         for (int iter = 0; iter < max_iterations_; ++iter)
         {
-            auto C0 = findCorrespondences(transformed, ref);
+            auto C0 = findCorrespondences(transformed, ref, max_correspondence_);
             auto C1 = trimCorrespondences(transformed, ref, C0, trim_ratio_);
             if (C1.size() < 3) { last_assoc = C1; break; }
 
@@ -363,13 +374,13 @@ private:
             composeSE2(sdx, sdy, sdth, acc_dx, acc_dy, acc_dth, ndx, ndy, ndth);
             acc_dx = ndx; acc_dy = ndy; acc_dth = ndth;
 
-            transformed = applyTransform(transformed, sdx, sdy, sdth);
+            transformed = applyTransform(curr, acc_dx, acc_dy, acc_dth);
             last_assoc = C1;
 
             if (fabs(sdx) < 1e-9 && fabs(sdy) < 1e-9 && fabs(sdth) < 1e-9) break;
         }
 
-        auto final_C0 = findCorrespondences(transformed, ref);
+        auto final_C0 = findCorrespondences(transformed, ref, max_correspondence_);
         auto final_C1 = trimCorrespondences(transformed, ref, final_C0, trim_ratio_);
         double score = fitnessScorePLICP(transformed, final_C1, ref);
 
@@ -406,7 +417,9 @@ int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<graph_slam::ScanMatcher>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }
