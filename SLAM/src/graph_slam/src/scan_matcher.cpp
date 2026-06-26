@@ -17,7 +17,7 @@ vector<Point2D> scanToCloud(sensor_msgs::msg::LaserScan& scan)
     vector<Point2D> cloud;
     cloud.reserve(scan.ranges.size());
     double angle = scan.angle_min;
-    for (size_t i = 0; i < scan.ranges.size(); ++i)
+    for (int i = 0; i < scan.ranges.size(); ++i)
     {
         double r = scan.ranges[i];
         if (!isfinite(r) || r <= scan.range_min || r >= scan.range_max)
@@ -31,25 +31,22 @@ vector<Point2D> scanToCloud(sensor_msgs::msg::LaserScan& scan)
     return cloud;
 }
 
-Eigen::Matrix2d R(double theta)
-{
-    double c = cos(theta), s = sin(theta);
-    Eigen::Matrix2d M;
-    M << c, -s,
-         s,  c;
-    return M;
-}
 
 vector<Point2D> applyTransform(vector<Point2D> cloud, double tx, double ty, double theta)
 {
-    Eigen::Matrix2d Rm = R(theta);
+    double c = cos(theta);
+    double s = sin(theta);
     vector<Point2D> out(cloud.size());
-    for (size_t i = 0; i < cloud.size(); ++i)
+    for (int i = 0; i < cloud.size(); ++i)
     {
-        Eigen::Vector2d p(cloud[i].x, cloud[i].y);
-        Eigen::Vector2d pw = Rm*p + Eigen::Vector2d(tx, ty);
-        out[i] = { pw(0), pw(1) };
+        double x = cloud[i].x;
+        double y = cloud[i].y;
+        out[i] = {
+            c * x - s * y + tx,
+            s * x + c * y + ty
+        };
     }
+
     return out;
 }
 
@@ -63,14 +60,13 @@ struct Correspondence {
 vector<Correspondence> findCorrespondences(Cloud transformed, Cloud ref, double max_correspondence_dist)
 {
     vector<Correspondence> C(transformed.size());
-    int M = ref.size();
     double max_d2 = max_correspondence_dist * max_correspondence_dist;
     for (int i = 0; i < transformed.size(); ++i)
     {
         double best1 = numeric_limits<double>::max();
         double best2 = numeric_limits<double>::max();
         int j1 = -1, j2 = -1;
-        for (int j = 0; j < M; ++j)
+        for (int j = 0; j < ref.size(); ++j)
         {
             double dx = transformed[i].x - ref[j].x;
             double dy = transformed[i].y - ref[j].y;
@@ -124,15 +120,25 @@ vector<Correspondence> trimCorrespondences(Cloud transformed, Cloud ref, vector<
         double e = n.dot(pw - pj1);
         errors.push_back({e*e, k});
     }
-    sort(errors.begin(), errors.end());
     int keep = static_cast<int>(trim_ratio * errors.size());
-    if (keep < 3 && errors.size() >= 3) keep = 3;
+    if (keep < 3 && errors.size() >= 3)
+        keep = 3;
+
+    keep = min(keep, static_cast<int>(errors.size()));
+
+    std::partial_sort(
+        errors.begin(),
+        errors.begin() + keep,
+        errors.end());
+
     vector<Correspondence> Ctrim;
     Ctrim.reserve(keep);
-    for (int k = 0; k < keep && k < errors.size(); ++k)
+
+    for (int k = 0; k < keep; ++k)
     {
         Ctrim.push_back(C[errors[k].second]);
     }
+
     return Ctrim;
 }
 
@@ -170,8 +176,8 @@ vector<double> solveQuartic(double a4, double a3, double a2, double a1, double a
             double a = a2/a3, b = a1/a3, c = a0/a3;
             double disc = b*b - 4*a*c;
             if (disc >= 0) {
-                roots.push_back((-b + sqrt(disc)) / 2.0);
-                roots.push_back((-b - sqrt(disc)) / 2.0);
+                roots.push_back((-b + sqrt(disc)) / (2.0*a));
+                roots.push_back((-b - sqrt(disc)) / (2.0*a));
             }
         }
         return roots;
@@ -196,18 +202,25 @@ vector<double> solveQuartic(double a4, double a3, double a2, double a1, double a
 bool computeTransformPLICP(Cloud src, vector<Correspondence> C, Cloud ref,
                             double& dx, double& dy, double& dtheta)
 {
-    if (C.size() < 3) return false;
+    if (C.size() < 3) 
+    {
+        return false;
+    }
 
     Eigen::Matrix4d Macc = Eigen::Matrix4d::Zero();
     Eigen::Vector4d g = Eigen::Vector4d::Zero();
 
-    for (auto& c : C)
+    for (int k = 0; k < C.size(); ++k)
     {
+        auto& c = C[k];
         Eigen::Vector2d pj1(ref[c.j1].x, ref[c.j1].y);
         Eigen::Vector2d pj2(ref[c.j2].x, ref[c.j2].y);
         Eigen::Vector2d d = pj2 - pj1;
         double len = d.norm();
-        if (len < 1e-12) continue;
+        if (len < 1e-12) 
+        {
+            continue;
+        }
         Eigen::Vector2d n(-d(1)/len, d(0)/len);
         Eigen::Matrix2d Ci = n*n.transpose();
 
@@ -255,7 +268,10 @@ bool computeTransformPLICP(Cloud src, vector<Correspondence> C, Cloud ref,
     double a0 = Dt*Dt - c0;
 
     vector<double> roots = solveQuartic(a4, a3, a2, a1, a0);
-    if (roots.empty()) return false;
+    if (roots.empty()) 
+    {
+        return false;
+    }
 
     bool found = false;
     double best_cost = numeric_limits<double>::max();
@@ -264,12 +280,19 @@ bool computeTransformPLICP(Cloud src, vector<Correspondence> C, Cloud ref,
     for (double lambda : roots)
     {
         Eigen::Matrix4d Z = 2.0*Macc + 2.0*lambda*Wm;
-        if (fabs(Z.determinant()) < 1e-12) continue;
+        if (fabs(Z.determinant()) < 1e-12) 
+        {
+            continue;
+        }
         Eigen::Vector4d x = -Z.inverse()*g;
         double norm2 = x(2)*x(2) + x(3)*x(3);
-        if (!isfinite(norm2) || norm2 < 1e-9) continue;
+        if (!isfinite(norm2) || norm2 < 1e-9) 
+        {
+            continue;
+        }
         double scale = 1.0/sqrt(norm2);
-        x(2) *= scale; x(3) *= scale;
+        x(2) *= scale; 
+        x(3) *= scale;
 
         double cost = polishedCost(src, C, ref, x);
         if (cost < best_cost)
@@ -279,7 +302,10 @@ bool computeTransformPLICP(Cloud src, vector<Correspondence> C, Cloud ref,
             found = true;
         }
     }
-    if (!found) return false;
+    if (!found) 
+    {
+        return false;
+    }
 
     dx = best_x(0);
     dy = best_x(1);
@@ -291,8 +317,9 @@ double fitnessScorePLICP(Cloud transformed, vector<Correspondence> C, Cloud ref)
 {
     if (C.empty()) return numeric_limits<double>::max();
     double total = 0;
-    for (auto& c : C)
+    for (int k = 0; k < C.size(); ++k)
     {
+        auto& c = C[k];
         Eigen::Vector2d pj1(ref[c.j1].x, ref[c.j1].y);
         Eigen::Vector2d pj2(ref[c.j2].x, ref[c.j2].y);
         Eigen::Vector2d d = pj2 - pj1;
@@ -320,25 +347,29 @@ class ScanMatcher : public rclcpp::Node
 public:
     ScanMatcher() : Node("scan_matcher")
     {
-        max_iterations_     = this->declare_parameter("max_iterations",     100);
-        max_correspondence_ = this->declare_parameter("max_correspondence", 0.8);
-        fitness_threshold_  = this->declare_parameter("fitness_threshold",  0.12);
-        trim_ratio_         = this->declare_parameter("trim_ratio",         0.9);
+        max_iterations_ = declare_parameter("max_iterations", 100);
+        max_correspondence_ = declare_parameter("max_correspondence", 0.8);
+        fitness_threshold_  = declare_parameter("fitness_threshold", 0.12);
+        trim_ratio_ = declare_parameter("trim_ratio",0.9);
 
-        svc_ = this->create_service<graph_slam::srv::ScanMatch>(
+        cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        svc_ = create_service<graph_slam::srv::ScanMatch>(
             "graph_slam/scan_match",
             std::bind(&ScanMatcher::matchCallback, this,
-                      std::placeholders::_1, std::placeholders::_2));
+                      std::placeholders::_1, std::placeholders::_2),
+            rmw_qos_profile_services_default,
+            cb_group_);
 
         RCLCPP_INFO(this->get_logger(), "[ScanMatcher] PL-ICP ready.");
     }
 
 private:
+    rclcpp::CallbackGroup::SharedPtr cb_group_;
     rclcpp::Service<graph_slam::srv::ScanMatch>::SharedPtr svc_;
     int    max_iterations_;
     double max_correspondence_, fitness_threshold_, trim_ratio_;
 
-    void matchCallback(const std::shared_ptr<graph_slam::srv::ScanMatch::Request> req,
+    void matchCallback(std::shared_ptr<graph_slam::srv::ScanMatch::Request> req,
                        std::shared_ptr<graph_slam::srv::ScanMatch::Response> res)
     {
         Cloud ref  = scanToCloud(req->reference_scan);
@@ -361,7 +392,11 @@ private:
         {
             auto C0 = findCorrespondences(transformed, ref, max_correspondence_);
             auto C1 = trimCorrespondences(transformed, ref, C0, trim_ratio_);
-            if (C1.size() < 3) { last_assoc = C1; break; }
+            if (C1.size() < 3) 
+            { 
+              last_assoc = C1; 
+              break; 
+            }
 
             double sdx, sdy, sdth;
             if (!computeTransformPLICP(transformed, C1, ref, sdx, sdy, sdth))
@@ -372,12 +407,17 @@ private:
 
             double ndx, ndy, ndth;
             composeSE2(sdx, sdy, sdth, acc_dx, acc_dy, acc_dth, ndx, ndy, ndth);
-            acc_dx = ndx; acc_dy = ndy; acc_dth = ndth;
+            acc_dx = ndx; 
+            acc_dy = ndy; 
+            acc_dth = ndth;
 
             transformed = applyTransform(curr, acc_dx, acc_dy, acc_dth);
             last_assoc = C1;
 
-            if (fabs(sdx) < 1e-9 && fabs(sdy) < 1e-9 && fabs(sdth) < 1e-9) break;
+            if (fabs(sdx) < 1e-9 && fabs(sdy) < 1e-9 && fabs(sdth) < 1e-9) 
+            {
+                break;
+            }
         }
 
         auto final_C0 = findCorrespondences(transformed, ref, max_correspondence_);
@@ -398,8 +438,8 @@ private:
         res->score   = score;
 
         double sigma2   = max(score, 1e-6);
-        double info_xy  = min(1.0 / sigma2,        400.0);
-        double info_yaw = min(info_xy * 0.25,      200.0);
+        double info_xy  = min(1.0 / sigma2,400.0);
+        double info_yaw = min(info_xy * 0.25,200.0);
 
         Eigen::Matrix3d info = Eigen::Matrix3d::Zero();
         info(0,0) = info_xy;

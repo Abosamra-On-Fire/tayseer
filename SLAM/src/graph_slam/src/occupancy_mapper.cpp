@@ -14,25 +14,24 @@
 using namespace std;
 namespace graph_slam {
 
-const double LOGODD_HIT  =  1.0;
+const double LOGODD_HIT =  1.0;
 const double LOGODD_MISS = -0.25;
-const double LOGODD_MIN  = -2.0;
-const double LOGODD_MAX  =  4.0;
+const double LOGODD_MIN = -2.0;
+const double LOGODD_MAX =  4.0;
 
 class OccupancyMapper : public rclcpp::Node
 {
 public:
-    explicit OccupancyMapper()
+    OccupancyMapper()
     : Node("occupancy_mapper")
     {
-        map_resolution_     = declare_parameter<double>("map_resolution",     0.05);
-        map_width_m_        = declare_parameter<double>("map_width_m",        40.0);
-        map_height_m_       = declare_parameter<double>("map_height_m",       40.0);
+        map_resolution_ = declare_parameter<double>("map_resolution",     0.05);
+        map_width_m_ = declare_parameter<double>("map_width_m",        40.0);
+        map_height_m_ = declare_parameter<double>("map_height_m",       40.0);
         publish_period_sec_ = declare_parameter<double>("publish_period_sec", 0.5);
-        map_angle_step_deg_ = declare_parameter<double>("map_angle_step_deg", 0.5);
-        fov_half_deg_       = declare_parameter<double>("fov_half_deg",       60.0);
+        fov_half_deg_ = declare_parameter<double>("fov_half_deg",       60.0);
 
-        width_cells_  = map_width_m_  / map_resolution_;
+        width_cells_ = map_width_m_ / map_resolution_;
         height_cells_ = map_height_m_ / map_resolution_;
         origin_x_ = -map_width_m_  / 2.0;
         origin_y_ = -map_height_m_ / 2.0;
@@ -47,20 +46,11 @@ public:
 
         pub_map_ = create_publisher<nav_msgs::msg::OccupancyGrid>("/map", rclcpp::QoS(1).transient_local());
 
-        sub_trigger_ = create_subscription<std_msgs::msg::Bool>(
-            "/graph_slam/trigger_remap", 1,
-            [this](std_msgs::msg::Bool::SharedPtr msg){ triggerCallback(msg); },
-            sub_opts);
+        sub_trigger_ = create_subscription<std_msgs::msg::Bool>("/graph_slam/trigger_remap", 1,[this](std_msgs::msg::Bool::SharedPtr msg){ onTrigger(msg); },sub_opts);
 
-        clt_get_graph_ = create_client<graph_slam::srv::GetGraph>(
-            "graph_slam/get_graph",
-            rmw_qos_profile_services_default,
-            cb_group_get_graph_);
+        clt_get_graph_ = create_client<graph_slam::srv::GetGraph>("graph_slam/get_graph",rmw_qos_profile_services_default,cb_group_get_graph_);
 
-        timer_ = create_wall_timer(
-            std::chrono::duration<double>(publish_period_sec_),
-            [this](){ incrementalUpdate(); },
-            cb_group_reentrant_);
+        timer_ = create_wall_timer(chrono::duration<double>(publish_period_sec_),[this](){ onTimer(); },cb_group_reentrant_);
 
         RCLCPP_INFO(get_logger(),
             "[OccupancyMapper] %.0fx%.0f m @ %.3f m/cell = %dx%d cells  fov=+/-%.0f deg",
@@ -69,10 +59,10 @@ public:
     }
 
 private:
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr       sub_trigger_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_trigger_;
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_map_;
-    rclcpp::Client<graph_slam::srv::GetGraph>::SharedPtr        clt_get_graph_;
-    rclcpp::TimerBase::SharedPtr                                timer_;
+    rclcpp::Client<graph_slam::srv::GetGraph>::SharedPtr clt_get_graph_;
+    rclcpp::TimerBase::SharedPtr timer_;
 
     rclcpp::CallbackGroup::SharedPtr cb_group_reentrant_;
     rclcpp::CallbackGroup::SharedPtr cb_group_get_graph_;
@@ -80,19 +70,21 @@ private:
     double map_resolution_;
     double map_width_m_, map_height_m_;
     double publish_period_sec_;
-    double map_angle_step_deg_;
     double fov_half_deg_;
 
-    int    width_cells_, height_cells_;
-    double origin_x_,    origin_y_;
+    int width_cells_, height_cells_;
+    double origin_x_, origin_y_;
     vector<double> log_odds_;
 
     int  last_mapped_node_ = -1;
-    std::atomic<bool> incremental_in_flight_{false};
+    atomic<bool> incremental_in_flight_{false};
 
-    void triggerCallback(std_msgs::msg::Bool::SharedPtr msg)
+    void onTrigger(std_msgs::msg::Bool::SharedPtr msg)
     {
-        if (!msg->data) return;
+        if (!msg->data) 
+        {
+            return;
+        }
         RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild triggered");
 
         fill(log_odds_.begin(), log_odds_.end(), 0.0);
@@ -102,34 +94,49 @@ private:
         clt_get_graph_->async_send_request(req,
             [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture f) {
             auto resp = f.get();
-            if (!resp) return;
+            if (!resp) 
+            {
+                return;
+            }
 
-            int N = static_cast<int>(resp->ids.size());
-            if (N == 0) { RCLCPP_WARN(get_logger(), "[OccupancyMapper] Graph empty"); return; }
+            int N = resp->ids.size();
+            if (N == 0) 
+            { 
+                RCLCPP_WARN(get_logger(), "[OccupancyMapper] Graph empty"); 
+                return; 
+            }
 
-            for (int i = 0; i < N; ++i)
-                insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
-
+            for (int i = 0; i < N; i++)
+                {
+                    insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
+                }
             last_mapped_node_ = N - 1;
             publishMap();
             RCLCPP_INFO(get_logger(), "[OccupancyMapper] Full rebuild done: %d nodes", N);
         });
     }
 
-    void incrementalUpdate()
+    void onTimer()
     {
         bool expected = false;
-        if (!incremental_in_flight_.compare_exchange_strong(expected, true)) return;
+        if (!incremental_in_flight_.compare_exchange_strong(expected, true)) 
+        {
+            return;
+        }
+
         auto req = std::make_shared<graph_slam::srv::GetGraph::Request>();
         clt_get_graph_->async_send_request(req,
             [this](rclcpp::Client<graph_slam::srv::GetGraph>::SharedFuture f) {
             incremental_in_flight_ = false;
             auto resp = f.get();
-            if (!resp) return;
+            if (!resp) 
+            {
+                return;
+            }
 
-            int N = static_cast<int>(resp->ids.size());
+            int N = resp->ids.size();
             bool changed = false;
-            for (int i = last_mapped_node_ + 1; i < N; ++i) {
+            for (int i = last_mapped_node_ + 1; i < N; i++) {
                 insertScan(resp->xs[i], resp->ys[i], resp->thetas[i], resp->scans[i]);
                 changed = true;
             }
@@ -140,36 +147,35 @@ private:
         });
     }
 
-    void insertScan(double x, double y, double theta,
-                    const sensor_msgs::msg::LaserScan& scan)
+
+    void insertScan(double x, double y, double theta, sensor_msgs::msg::LaserScan& scan)
     {
-        if (scan.ranges.empty()) return;
-
-        int rx = worldToCell(x, true);
-        int ry = worldToCell(y, false);
-
-        double step_rad = map_angle_step_deg_ * M_PI / 180.0;
-        int    step     = max(1, static_cast<int>(step_rad / scan.angle_increment));
-        double fov_rad  = fov_half_deg_ * M_PI / 180.0;
-
-        double angle = scan.angle_min;
-        for (size_t i = 0; i < scan.ranges.size();
-             i += step, angle += step * scan.angle_increment)
+        if (scan.ranges.empty()) 
         {
-            double a_norm = fmod(angle + M_PI, 2.0*M_PI) - M_PI;
-            if (fabs(a_norm) > fov_rad) continue;
+            return;
+        }
 
-            float r   = scan.ranges[i];
+        double fov_rad = fov_half_deg_ * M_PI / 180.0;
+        double angle = scan.angle_min;
+
+        for (int i = 0; i <scan.ranges.size(); i++)
+        {
+            angle=wrapAngle(angle);
+            if (fabs(angle) > fov_rad) 
+            {
+                angle += scan.angle_increment;
+                continue;
+            }
+
+            double r   = scan.ranges[i];
             bool  hit = isfinite(r) && r > scan.range_min && r < scan.range_max;
 
-            double end_r = hit ? static_cast<double>(r) : scan.range_max;
-            double wx    = x + end_r * cos(theta + angle);
+            double end_r = hit ? r : scan.range_max;
+            double wx    = x + end_r * cos(theta + angle);//converting from polar to cartesian coordinates
             double wy    = y + end_r * sin(theta + angle);
 
-            int ex = worldToCell(wx, true);
-            int ey = worldToCell(wy, false);
-
-            bresenham(rx, ry, ex, ey, hit);
+            bresenham(toCell(x, true), toCell(y, false), toCell(wx, true), toCell(wy, false), hit);
+            angle += scan.angle_increment;
         }
     }
 
@@ -182,12 +188,15 @@ private:
         int x  = x0, y = y0;
 
         while (true) {
-            if (x < 0 || x >= width_cells_ || y < 0 || y >= height_cells_) break;
+            if (x < 0 || x >= width_cells_ || y < 0 || y >= height_cells_) 
+            {
+                break;
+            }
 
             if (x == x1 && y == y1) {
                 if (mark_hit) {
                     updateCell(x, y, LOGODD_HIT);
-                    smearOccupied(x, y, 2, LOGODD_HIT / 2.0);
+                    smear(x, y, 2, LOGODD_HIT / 2.0);
                 }
                 break;
             }
@@ -195,18 +204,32 @@ private:
             updateCell(x, y, LOGODD_MISS);
 
             int f2 = 2 * f;
-            if (f2 > -dy) { f -= dy; x += sx; }
-            if (f2 <  dx) { f += dx; y += sy; }
+            if (f2 > -dy) 
+            { 
+              f -= dy;
+              x += sx; 
+            }
+            if (f2 <  dx) 
+            { 
+                f += dx; 
+                y += sy; 
+            }
         }
     }
 
-    void smearOccupied(int cx, int cy, int radius_cells, double delta)
+    void smear(int cx, int cy, int radius, double delta)
     {
-        for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
-            for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
-                if (dx*dx + dy*dy > radius_cells*radius_cells) continue;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -radius; dy <= radius; dy++) {
+                if (dx*dx + dy*dy > radius*radius) 
+                { 
+                    continue;
+                }
                 int nx = cx + dx, ny = cy + dy;
-                if (nx < 0 || nx >= width_cells_ || ny < 0 || ny >= height_cells_) continue;
+                if (nx < 0 || nx >= width_cells_ || ny < 0 || ny >= height_cells_) 
+                {
+                    continue;
+                }
                 updateCell(nx, ny, delta);
             }
         }
@@ -218,17 +241,17 @@ private:
         log_odds_[idx] = min(max(log_odds_[idx] + delta, LOGODD_MIN), LOGODD_MAX);
     }
 
-    int worldToCell(double coord, bool is_x)
+    int toCell(double coord, bool is_x)
     {
         double origin = is_x ? origin_x_ : origin_y_;
-        return static_cast<int>((coord - origin) / map_resolution_);
+        return (int)((coord - origin) / map_resolution_);
     }
 
     void publishMap()
     {
         nav_msgs::msg::OccupancyGrid grid;
         grid.header.frame_id           = "map";
-        grid.header.stamp              = this->get_clock()->now();
+        grid.header.stamp              = get_clock()->now();
         grid.info.resolution           = map_resolution_;
         grid.info.width                = width_cells_;
         grid.info.height               = height_cells_;
@@ -237,16 +260,16 @@ private:
         grid.info.origin.orientation.w = 1.0;
 
         grid.data.resize(width_cells_ * height_cells_);
-        for (size_t i = 0; i < log_odds_.size(); ++i) {
+        for (int i = 0; i < log_odds_.size(); i++) {
             if      (log_odds_[i] >  1.0) grid.data[i] = 100;
             else if (log_odds_[i] < -0.5) grid.data[i] = 0;
-            else                           grid.data[i] = -1;
+            else                          grid.data[i] = -1;
         }
         pub_map_->publish(grid);
     }
 };
 
-} 
+}
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
